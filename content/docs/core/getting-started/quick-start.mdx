@@ -1,0 +1,224 @@
+---
+title: 快速开始
+description: 做一个能跑起来的 Native 插件
+icon: Rocket
+status: wip
+---
+
+走完此页的流程，你应该能获得一个能跑起来的，属于你自己的 Native 插件。
+
+## 准备
+
+- [装好 CloverCore](/docs/core/getting-started/installation)
+- Clang 22+（Windows 上使用 clang-cl）
+- CMake 4.0+
+- Ninja，或者其他 CMake 支持的构建系统
+
+<Callout type="warn">
+  标准库必须用 CloverNT 提供的 libc++，MSVC 的 STL 不行。  
+  模板的 CMake 已经处理好了，原因见[工具链要求](/docs/core/getting-started/toolchain)。
+</Callout>
+
+## 动手
+
+<Steps>
+<Step>
+
+### 用模板建仓库
+
+在模板仓库页面点 **Use this template**，把新仓库克隆到本地。
+
+你需要关心的只有这些：
+
+<Files>
+  <Folder name="NativePluginTemplate" defaultOpen>
+    <Folder name="src" defaultOpen>
+      <File name="main.cpp" />
+    </Folder>
+    <File name="CMakeLists.txt" />
+    <File name="clover.json.in" />
+  </Folder>
+</Files>
+
+</Step>
+<Step>
+
+### 检查清单文件
+
+```json title="clover.json.in"
+{
+  "name": "MyNativePlugin",
+  "type": "native",
+  "version": "0.1.0",
+  "author": "your-name",
+  "description": "CloverNT Native Plugin Template",
+  "platform": "@PLUGIN_PLATFORM@",
+  "entry": "@PLUGIN_ENTRY@"
+}
+
+```
+
+<Callout type="info">
+  完整的字段说明在 [clover.json 清单](/docs/core/plugins/manifest)。
+</Callout>
+
+其中 `platform` 和 `entry` 会被自动生成，不需要你费心。
+
+你可以改一下 `name`，`author` 和 `description`，体现一下这个插件是你写的。
+
+此处的 `name` 会被 CMake 解析，并作为此项目的名字和动态链接库的名字，不需要你再去手动更改。
+
+本文的演示内不更改这些字段，请读者留意。
+
+
+</Step>
+<Step>
+
+### 看一眼插件类
+
+```cpp title="src/main.cpp"
+// CloverNT Native 插件模板
+//
+// Native 插件是一个导出了 clovernt_plugin_load 的动态库。CloverCore 把它映射进 QQ 进程之后会调用这个函数，
+// 导出由文件末尾的 CloverNT_REGISTER_PLUGIN 生成，不需要手写。
+//
+// 继承 PluginBase 可以用 logger()、name()、directory() 这些访问器。
+// load() 和 unload() 不是虚函数：宏在编译期用 concept 检测它们，签名必须是 bool()。
+
+#include <string_view>
+
+#include <CloverNT/API/Events/DllEvent.hpp>
+#include <CloverNT/API/Events/EventBus.hpp>
+#include <CloverNT/API/Logger.hpp>
+#include <CloverNT/API/Memory/Memory.hpp>
+#include <CloverNT/API/Plugin/PluginBase.hpp>
+#include <CloverNT/API/Plugin/RegisterHelper.hpp>
+
+using namespace CloverNT;
+
+namespace {
+
+class MyNativePlugin : public Plugin::PluginBase {
+public:
+    // 必须定义。返回 false 表示加载失败，框架会清掉这次加载里注册的监听器和 Hook。
+    bool load() {
+        logger().info("loaded from {}", directory().string());
+
+        // 看一眼宿主进程。findModule() 不传名字就是主程序
+        if (const auto host = Memory::findModule()) {
+            logger().info("host module '{}' @ {:#x}, {} bytes", host->name(), host->base(), host->size());
+        }
+
+        // 订阅事件。owner 默认是当前插件，卸载时框架会自动移除这个监听器。
+        // 回调可能在任意线程上执行，别在里面做耗时的事
+        auto listener =
+                Event::EventBus::getInstance().emplaceListener<Event::DllLoadEvent>([this](Event::DllLoadEvent& event) {
+                    if (std::string_view{event.baseName()}.ends_with(".node")) {
+                        logger().info("node addon loaded: {} ({} bytes)", event.baseName(), event.imageSize());
+                    }
+                });
+        if (!listener) {
+            logger().error("failed to subscribe to DllLoadEvent: {}", listener.error().message);
+            return false;
+        }
+        return true;
+    }
+
+    // 可选。只要定义了 unload()，这个插件就可以在运行时被卸载。
+    // 在这里释放你自己申请的东西（线程、文件、内存）。Hook 和监听器不用管，框架会处理
+    bool unload() {
+        logger().info("unloaded");
+        return true;
+    }
+};
+
+} // namespace
+
+CloverNT_REGISTER_PLUGIN(MyNativePlugin)
+```
+
+它做了三件事：打日志、看一眼宿主进程、订阅 `DllLoadEvent`。
+
+- `load()` 必须有，返回 `false` 表示加载失败。
+- `unload()` 可选，定义了它，插件才可以被热卸载。
+- 监听器的所有者默认是当前插件，卸载时框架会自动移除，不用在 `unload()` 里撤销。
+
+`load` 和 `unload` 不是虚函数。它们是被注册宏在编译期按 concept 探测出来的，所以函数名和签名必须是 `bool load()` 这个样子。
+
+具体的细枝末节在 [开发 Native 插件](/docs/core/plugins/native) 里有讲。
+
+</Step>
+<Step>
+
+### 编译
+
+```bash
+# Windows
+cmake -S . -B build -G Ninja -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang-cl -D CMAKE_CXX_COMPILER=clang-cl
+
+# Linux
+cmake -S . -B build -G Ninja -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang-22 -D CMAKE_CXX_COMPILER=clang++-22
+
+cmake --build build
+```
+
+第一次配置要两三分钟，它要拉取 CloverCore 和它的全部依赖（Alka、QQNT 的 V8 头文件、libc++ 等）。之后的构建都是增量的，改一个文件只要几秒。libc++ 和 QQNT SDK 缓存在用户目录里，换一个构建目录重新配置时不会再下载一遍，见[工具链要求](/docs/core/getting-started/toolchain#依赖)。
+
+<Callout type="warn">
+  `CMAKE_BUILD_TYPE` 要自己写上。模板没有设默认值，而 clang-cl 下 CMake 会把它默认成 `Debug`，得到的插件会链接调试用的运行库，和 Release 的 CloverCore 混用有崩溃的风险，见[开发 Native 插件](/docs/core/plugins/native#指定构建类型)。
+</Callout>
+
+<Callout type="info">
+
+如果你本地已经有 CloverCore 的源码，可以让它别再克隆：
+
+```bash
+cmake -S . -B build -G Ninja -D FETCHCONTENT_SOURCE_DIR_CLOVERCORE=/path/to/CloverCore ...
+```
+
+</Callout>
+
+</Step>
+<Step>
+
+### 部署并运行
+
+产物在 `build/dist/MyNativePlugin/`，里面已经是一个可以直接用的插件目录：
+
+<Files>
+  <Folder name="MyNativePlugin" defaultOpen>
+    <File name="clover.json" />
+    <File name="MyNativePlugin.dll" />
+  </Folder>
+</Files>
+
+把它整个复制到 CloverNT 的 `plugins/` 下。
+
+启动 CloverLoader，日志里会看到：
+
+```text
+[12:30:45.130 INF] [MyNativePlugin] loaded from <你的路径>/plugins/MyNativePlugin
+[12:30:45.130 INF] [MyNativePlugin] host module '<主程序>' @ <基址>, <大小> bytes
+[12:30:45.130 INF] [CloverCore] Loaded MyNativePlugin v0.1.0
+```
+
+之后 QQ 每加载一个 `.node` 模块，就会多一行 `node addon loaded: ...`。
+
+</Step>
+</Steps>
+
+## 自定义项目
+
+模板里的 CMake 配置为了开箱即用，只做了很少了一部分工作，并且大概率是和你的想法不适配的。
+
+你可以参阅 [开发 Native 插件](/docs/core/plugins/native#构建配置) 进行高级配置。
+
+## 跑通之后
+
+推荐看看这些：
+
+<Cards>
+  <Card title="插件模型" href="/docs/core/plugins" description="native、js、raw 三种类型分别是什么。" />
+  <Card title="clover.json 清单" href="/docs/core/plugins/manifest" description="全部字段与校验规则。" />
+  <Card title="事件系统" href="/docs/core/guides/events" description="监听封包、模块加载这些内建事件。" />
+</Cards>

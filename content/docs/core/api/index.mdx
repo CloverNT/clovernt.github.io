@@ -1,0 +1,135 @@
+---
+title: API 总览
+description: CloverCore 公开的 C++ API
+icon: Library
+status: wip
+---
+
+无需多言，开门见山。
+
+## 命名空间
+
+<TypeTable
+  type={{
+    'CloverNT': {
+      type: '日志、错误处理、异常',
+      description: 'Logger、Expected、Exception 等基础设施',
+    },
+    'CloverNT::Plugin': {
+      type: '插件',
+      description: 'PluginBase、PluginManager、Manifest、Version 等',
+    },
+    'CloverNT::Event': {
+      type: '事件',
+      description: 'EventBus、Listener、Cancellable、NamedEvent 和全部内建事件',
+    },
+    'CloverNT::Memory': {
+      type: '内存',
+      description: '模块、特征码、读写、补丁，Hook',
+    },
+    'CloverNT::Nt': {
+      type: 'QQNT 网络包',
+      description: 'Packet、O3Packet、Credential 以及收发函数',
+    },
+    'CloverNT::Utils': {
+      type: '工具',
+      description: 'DynamicLibrary 以及平台信息',
+    },
+  }}
+/>
+
+`CloverNT::Core` 下面是 CloverCore 的内部实现，头文件在 `include/CloverNT/Core/`，**不属于公开 API**，可能随版本改动。
+
+它们能被 `#include` ，但是他们的符号基本都没有被导出，也就是一般不可用。
+
+`CloverNT::Runtime` 是 CloverLoader 的 C 接口封装，在[另一个分区](/docs/loader)里。
+
+<Callout type="info">
+  一般不建议调用 CloverLoader，虽然它的 ABI 保持稳定。  
+  建议所有的插件都使用 CloverCore 提供的设施，他们更现代化，也更安全。
+</Callout>
+
+## 头文件列表
+
+<Files>
+  <Folder name="CloverNT/API" defaultOpen>
+    <Folder name="Plugin">
+      <File name="PluginBase.hpp" />
+      <File name="RegisterHelper.hpp" />
+      <File name="PluginManager.hpp" />
+      <File name="Plugin.hpp" />
+      <File name="NativePlugin.hpp" />
+      <File name="JsPlugin.hpp" />
+      <File name="PluginLoader.hpp" />
+      <File name="Manifest.hpp" />
+      <File name="Version.hpp" />
+    </Folder>
+    <Folder name="Events">
+      <File name="Event.hpp" />
+      <File name="EventBus.hpp" />
+      <File name="Listener.hpp" />
+      <File name="Cancellable.hpp" />
+      <File name="NamedEvent.hpp" />
+      <File name="NamedEventApi.hpp" />
+      <File name="DllEvent.hpp" />
+      <File name="PacketEvent.hpp" />
+    </Folder>
+    <Folder name="Memory">
+      <File name="Memory.hpp" />
+      <File name="Hook.hpp" />
+    </Folder>
+    <Folder name="Nt">
+      <File name="Packet.hpp" />
+    </Folder>
+    <Folder name="Utils">
+      <File name="System.hpp" />
+      <File name="DynamicLibrary.hpp" />
+    </Folder>
+    <File name="Logger.hpp" />
+    <File name="Expected.hpp" />
+    <File name="Exception.hpp" />
+    <File name="Macros.hpp" />
+  </Folder>
+</Files>
+
+## 按模块
+
+<Cards>
+  <Card title="Plugin" href="/docs/core/api/plugin" description="插件基类、注册宏、清单与管理器。" />
+  <Card title="Events" href="/docs/core/api/events" description="事件总线、监听器、优先级与内建事件。" />
+  <Card title="Memory" href="/docs/core/api/memory" description="模块、特征码、读写、补丁与 Hook。" />
+  <Card title="Nt" href="/docs/core/api/nt" description="网络包结构与收发。" />
+  <Card title="Utils" href="/docs/core/api/utils" description="平台信息与动态库。" />
+  <Card title="基础设施" href="/docs/core/api/core" description="日志、错误处理、异常与宏。" />
+</Cards>
+
+## 约定
+
+**错误处理用 `Expected<T>`，不抛异常。** 
+
+它是 `std::expected<T, Error>` 的别名，几乎所有可能失败的函数都返回它，并且标了 `[[nodiscard]]`，忽略返回值会得到编译警告。
+
+```cpp
+auto result = Memory::findModule("QQNT.dll");
+if (!result) {
+    logger().error("{}", result.error().message);
+    return false;
+}
+use(*result);
+```
+
+`Error` 带着类别、错误码和消息，详见[基础设施](/docs/core/api/core)。
+
+抛异常的只有少数场景，比如 `PluginBase::self()` 在绑定之前被调用。
+
+**头文件会引入 `Windows.h`。** `Macros.hpp` 在 Windows 上直接包含它，大部分公开头文件都会间接带进来。
+
+如果你对于 `min` / `max` 颇有心得，那请在引用它们之前之前定义 `NOMINMAX`。
+
+## 链接
+
+这些 API 的实现都在 CloverCore 的共享库里，Windows 上是 `CloverCore.dll`，Linux 上是 `CloverCore.so`。
+
+Windows 上插件要链接它的导入库，Linux 上不用，因为符号在加载时从进程里已经加载的库里解析。
+
+详见[开发 Native 插件](/docs/core/plugins/native#构建配置)。

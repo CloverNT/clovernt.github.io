@@ -1,0 +1,5 @@
+{
+  "title": "JavaScript SDK",
+  "icon": "Braces",
+  "pages": ["index", "context", "events", "packet"]
+}

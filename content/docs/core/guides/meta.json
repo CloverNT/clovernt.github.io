@@ -1,0 +1,5 @@
+{
+  "title": "进阶指南",
+  "icon": "Compass",
+  "pages": ["events", "hooking", "memory", "packets", "logging"]
+}

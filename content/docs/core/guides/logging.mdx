@@ -1,0 +1,132 @@
+---
+title: 日志
+description: 打印日志，查看日志，保存日志
+icon: ScrollText
+status: wip
+---
+
+无需多言。
+
+## 怎么打
+
+<Tabs items={['C++', 'JavaScript']}>
+  <Tab value="C++">
+
+  继承了 `PluginBase` 就直接用 `logger()`，标题已经是插件名了，不用自己拼前缀：
+
+  ```cpp
+  logger().info("loaded from {}", directory().string());
+  logger().warn("config missing, using defaults");
+  logger().error("failed: {}", result.error().message);
+  ```
+
+  格式串是 `std::format` 的语法，不是 printf 的。
+
+  没有继承 `PluginBase` 的话，可以自己从注册表里拿一个：
+
+  ```cpp
+  auto log = LoggerRegistry::getInstance().getOrCreate("MyPlugin");
+  log->info("hello");
+  ```
+
+  同一个标题永远拿到同一个日志器。
+
+  </Tab>
+  <Tab value="JavaScript">
+
+  主进程里用 `ctx.logger`：
+
+  ```js
+  ctx.logger.info(`loaded from ${ctx.coreDir}`);
+  ```
+
+  preload 和渲染进程里没有 `ctx`，用 `clovernt.log(scope)` 自己取一个，`scope` 通常填插件名：
+
+  ```js
+  const log = clovernt.log('MyPlugin');
+  log.info('hello from renderer');
+  ```
+
+  渲染进程的日志会通过 IPC 转到主进程，再进同一套输出。
+
+  JS 的日志方法只接收一个字符串，没有格式化。
+
+  </Tab>
+</Tabs>
+
+## 日志级别
+
+<TypeTable
+  type={{
+    debug: { type: 'DBG', description: '调试信息。默认不显示，见下' },
+    info: { type: 'INF', description: '正常的流程信息。默认的最低显示级别' },
+    warn: { type: 'WRN', description: '不影响运行，但值得留意的事' },
+    error: { type: 'ERR', description: '一个操作失败了' },
+    fatal: { type: 'FTL', description: '插件没法继续工作了' },
+  }}
+/>
+
+C++ 和 JS 都是这五级，没有 trace。从 `debug` 到 `fatal` 依次是 0 到 4。
+
+<Callout type="warn">
+  **`debug` 在 Release 构建里什么都不会输出。** 
+  
+  C++ 的 `Logger::debug` 被 `#ifdef CloverNT_DEBUG` 包住了，只有 Debug 配置才会定义这个宏，Release 下直接会被空优化掉。
+
+  JS 这边也一样：`debug` 最终调的是 CloverCore 里的同一个函数，发布出来的 CloverCore 是 Release 构建，所以 `logger.debug()` 同样没有输出。
+
+  想看调试信息，请用Debug 构建 CloverCore 和你自己的插件，或者直接用 `info`。
+</Callout>
+
+默认的最低级别是 `Info`，Debug 构建下是 `Debug`。可以用 `setMinLevel` 调。
+
+如果想知道某个级别能否打印出来，可以用 `shouldLog(level)`。
+
+## 日志去了哪
+
+每条日志的格式是这样：
+
+```text
+[12:30:45.130 INF] [MyPlugin] loaded from /path/to/plugins/MyPlugin
+ └ 时间戳      └ 级别  └ 标题（日志器的名字）
+```
+
+控制台输出带颜色：debug 青色、info 绿色、warn 黄色、error 红色、fatal 品红。
+
+默认输出到 CloverLoader 的控制台，如果拿不到 CloverLoader 的控制台出口，就退回标准输出。
+
+### 写到文件
+
+```cpp
+if (auto result = logger().setLogFile((dataDir() / "plugin.log").string()); !result) {
+    logger().error("{}", result.error().message);
+}
+```
+
+- 文件以**追加**模式打开，每条日志写完立即 flush，保存的是不带颜色的纯文本
+- 路径传空字符串，就不会输出到文件
+- 打不开文件时返回错误（`Failed to open log file`），不会抛异常
+- 要保证目录已经存在，`dataDir()` 不会自动创建
+
+JS 的主进程日志器也有 `setLogFile`，写不了时会抛错。
+
+### 其他的消费者
+
+`Logger` 支持挂多个消费者，用来把日志转到别处，比如自己的界面。
+
+参见[Logger API](/docs/core/api/core)。
+
+## 注意
+
+<Callout type="warn">
+  - 不要在 Hook 的 detour 里高频打日志。  
+  detour 在被挂钩函数的线程上执行，日志的格式化和输出都会拖慢它
+  - **不要把封包内容、凭据写进日志，尤其是写进文件**  
+  你知道这意味着什么。
+</Callout>
+
+## 参考
+
+<Cards>
+  <Card title="Logger API" href="/docs/core/api/core" />
+</Cards>

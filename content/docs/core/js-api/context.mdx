@@ -1,0 +1,168 @@
+---
+title: CloverContext
+description: 插件入口收到的上下文对象
+icon: Package
+status: wip
+---
+
+`ctx` 是 JS 插件入口收到的唯一参数。它和全局的 `clovernt` 不同：这里的成员都是必选的。
+
+**用 `ctx` 注册的东西，卸载时会自动清理**。
+
+```ts title="拿到 ctx"
+import { definePlugin } from '@clovernt/sdk';
+
+export default definePlugin({
+    onLoad(ctx) {
+        ctx.logger.info(`hello from ${ctx.name}`);
+    },
+});
+```
+
+## 身份与环境
+
+<TypeTable
+  type={{
+    name: { type: 'string', description: '当前插件名，取自 clover.json' },
+    version: { type: 'string', description: 'CloverCore 的版本号' },
+    loaderVersion: { type: 'string', description: 'CloverLoader 的版本号' },
+    coreDir: { type: 'string', description: 'CloverCore 所在目录的绝对路径' },
+    plugins: {
+      type: 'PluginInfo[]',
+      description: 'JS 插件的列表，不含 native 插件。每次访问都是最新的',
+    },
+  }}
+/>
+
+`PluginInfo` 里入口字段叫 `main`、`preload`、`renderer`，和 `clover.json` 里的 `entry`、`preloadEntry`、`rendererEntry` 一一对应，但名字不一样。
+
+值是解析后的绝对路径。
+
+## 能力
+
+<TypeTable
+  type={{
+    logger: {
+      type: 'CloverLogger',
+      description: '已经绑好插件名的日志器，不用再调 clovernt.log()',
+    },
+    events: {
+      type: 'CloverEvents',
+      description: '事件 API。通过它注册的监听器记在这个插件名下，卸载时自动移除',
+    },
+    packet: { type: 'PacketApi', description: '封包 API，和全局的是同一个' },
+  }}
+/>
+
+## Electron
+
+`ctx` 能直接获取 `electron` 对象，不用自己 `require('electron')`。
+
+不过这些只在主进程入口里可用。
+
+<TypeTable
+  type={{
+    electron: {
+      type: 'typeof import("electron")',
+      description: '完整的 electron 模块。直接用它做的事不会被自动清理',
+    },
+    'app.on(event, listener)': {
+      type: 'void',
+      description: '对应 electron.app.on。卸载时自动 removeListener。app 上只暴露了 on，别的要从 ctx.electron.app 取',
+    },
+    'ipcMain.on(channel, listener)': {
+      type: 'void',
+      description: '对应 ipcMain.on。卸载时自动 removeListener',
+    },
+    'ipcMain.handle(channel, listener)': {
+      type: 'void',
+      description: '对应 ipcMain.handle。卸载时自动 removeHandler。Electron 同一个 channel 只允许一个 handle',
+    },
+    'onHeadersReceived(session, listener)': {
+      type: 'void',
+      description: '拦截某个 session 收到的响应头，对应 session.webRequest.onHeadersReceived，典型用途是放宽 CSP',
+    },
+  }}
+/>
+
+<Callout type="warn">
+  `onHeadersReceived` 要留意：Electron 里 `webRequest` 的每个事件**只能有一个监听器**，后注册的会替换先注册的。
+  
+  而卸载时清理做的是 `webRequest.onHeadersReceived(null)`，把整个监听器置空，不管它是不是你的。
+
+  所以两个插件都用它的话，后加载的会把先加载的顶掉，任何一个被卸载时又会把对方的清掉。
+</Callout>
+
+## 定时器
+
+<TypeTable
+  type={{
+    'setTimeout(handler, ms?, ...args)': {
+      type: 'NodeJS.Timeout',
+      description: '行为同全局的 setTimeout，区别是卸载时会自动清除',
+    },
+    'setInterval(handler, ms?, ...args)': {
+      type: 'NodeJS.Timeout',
+      description: '行为同全局的 setInterval，区别是卸载时会自动清除',
+    },
+  }}
+/>
+
+用全局的 `setInterval` 的话，插件卸载之后它还会继续跑，回调执行的是已经被清理的代码。
+
+插件里的定时器都用 `ctx` 上的这两个。
+
+## 卸载钩子
+
+<TypeTable
+  type={{
+    'onUnload(fn)': {
+      type: 'void',
+      description: '注册一个清理回调，可以注册多次。卸载时按**注册的相反顺序**依次调用，没有参数。回调里抛错会被收集起来报告，不会阻止后面的清理继续执行。回调可以是 async 函数，但返回的 Promise 不会被等待',
+    },
+  }}
+/>
+
+函数式入口返回的函数也是作为一个清理回调登记的。
+
+```ts
+import { definePlugin } from '@clovernt/sdk';
+
+export default definePlugin({
+    onLoad(ctx) {
+        const socket = openSomething();
+        ctx.onUnload(() => socket.close());
+    },
+});
+```
+
+## 卸载之后
+
+插件卸载完成后，`ctx` 上的方法会变成空操作：`setTimeout` 不会再创建定时器，`ipcMain.handle` 不会再注册。
+
+如果你的代码有异步的东西留下了，在卸载之后才执行到这些调用，它们会悄悄什么都不做，不会报错。
+
+## 完整示例
+
+```ts title="src/main.ts"
+import { definePlugin } from '@clovernt/sdk';
+
+export default definePlugin({
+    onLoad(ctx) {
+        const log = ctx.logger;
+
+        ctx.ipcMain.handle('demo:ping', () => 'pong');
+
+        ctx.app.on('before-quit', () => log.info('quitting'));
+
+        ctx.setInterval(() => log.info('still alive'), 60_000);
+
+        // events.on 注册的监听器也会在卸载时自动移除
+        ctx.events.on('dll-load', (payload) => {
+            log.info(`module loaded: ${payload.baseName}`);
+        });
+
+        ctx.onUnload(() => log.info('bye'));
+    },
+});
+```

@@ -1,0 +1,260 @@
+---
+title: 插件生命周期
+description: 整个框架和插件的加载与停止
+icon: Workflow
+status: wip
+---
+
+了解框架和你的插件被加载的时序很重要。
+
+## 启动时发生了什么
+
+<Steps>
+<Step>
+
+### 等 Node 环境就绪
+
+CloverLoader 加载 CloverCore 之后，CloverCore 先把自己的基础模块（事件总线、Hook 运行时）准备好，然后**等 QQ 的 Node 环境就绪**，插件运行时在这时才会被启用。
+
+所以插件不是 QQ 一启动就加载的。JS 插件还要再等 Electron 的 `app` 就绪。
+
+</Step>
+<Step>
+
+### 扫描
+
+CloverCore 会遍历 `plugins/` 下的每个子目录，并读它们的 `clover.json`：
+
+- 清单有问题的会报告错误然后跳过，不影响别的插件
+- `type` 为 `raw` 的跳过
+- 名字重复的跳过
+
+</Step>
+<Step>
+
+### 确定加载哪些
+
+先把所有**非被动**的插件，连同它们的依赖，放进候选集合。然后反复移除直到集合稳定：
+
+- 平台不符的，移除
+- 硬依赖缺失或版本不满足的，移除
+- 与已选中的插件冲突的，移除声明了冲突的那一方
+
+移除是级联的：A 被移除了，依赖 A 的 B 也会跟着被移除。
+
+所有被移除的原因会汇总成一条错误日志。
+
+</Step>
+<Step>
+
+### 排序
+
+按依赖关系做拓扑排序，同一层按名字的字典序。
+
+**依赖成环的话，所有插件都不会加载**，并会报告 `plugin dependencies contain a cycle`。
+
+</Step>
+<Step>
+
+### 逐个加载
+
+按排好的顺序处理。某个插件的硬依赖加载失败了，它自己也会失败，日志是 `a dependency failed to load`。
+
+- `native`：检查入口路径，加载动态库，查找 `clovernt_plugin_load` 并调用
+- `js`：加入进 JS 插件待加载队列，等 Electron 就绪后依次加载
+- 其他类型：等所有 native 和 js 插件都处理完，再交给对应的加载器
+
+</Step>
+<Step>
+
+### 汇总
+
+日志里依次是 `Loading plugins...`、每个插件的 `Loaded 名字 v版本`、最后是 `Loaded N plugin(s).`。
+
+失败的插件会各有一行 `Failed to load 名字: 原因`。
+
+</Step>
+</Steps>
+
+## Native 插件的加载细节
+
+对于 native 插件，加载时的行为和要求如下：
+
+1. `entry` 必须是相对路径，不能指到插件目录之外，文件必须存在，否则会报告 `invalid entry path`。
+2. 加载动态库。Windows 上会把插件目录加进 DLL 搜索路径，所以同目录的依赖库能被找到；Linux 的 `dlopen` 做不到这点，插件自带的依赖库要靠 `RUNPATH`（`$ORIGIN`）来定位
+3. 寻找 `clovernt_plugin_load`，找不到就是 `does not export clovernt_plugin_load`
+4. 把 `CurrentPlugin` 设成这个插件，在异常捕获下调用 `load()`。
+
+<TypeTable
+  type={{
+    'load() 返回 true': {
+      type: '加载成功',
+      description: '状态变 Loaded。如果定义了 unload()，插件将会被标记成可卸载',
+    },
+    'load() 返回 false': {
+      type: '加载失败',
+      description: '清理掉这个插件已注册的 Hook 和事件监听器，关闭动态库，状态变 Failed，报告 load callback failed',
+    },
+    'load() 抛出异常': {
+      type: '加载失败',
+      description: '处理方式同上条，报告 load callback threw: 异常信息，并且异常不会影响别的插件',
+    },
+    'load() 里触发硬件异常': {
+      type: '加载失败',
+      description: '访问违例这类异常会被转成 StructuredException，按"抛出异常"处理',
+    },
+  }}
+/>
+
+## 状态
+
+每个插件对象都有一个状态：
+
+<TypeTable
+  type={{
+    Unloaded: { type: '未加载', description: '初始状态，也是卸载成功之后的状态' },
+    Loading: { type: '加载中' },
+    Loaded: { type: '已加载' },
+    Unloading: { type: '卸载中' },
+    Failed: { type: '失败', description: '加载失败，或者卸载过程中清理不完整' },
+  }}
+/>
+
+`CloverCore` 本身是一个内建插件，一直是 `Loaded`，不能被卸载或重载。
+
+## 卸载
+
+卸载由 `PluginManager::unloadPlugin` 发起，也可以由退出流程触发。
+
+卸载插件有如下几个要求：
+
+- `CloverCore` 不能卸载
+- 状态必须是 `Loaded` 或 `Failed`
+- **只要有别的已加载插件依赖它（包括硬依赖和软依赖），就不能卸载**，会报告 `X cannot be unloaded because Y depends on it`
+- native 插件必须定义了 `unload()`，否则会报告 `does not support hot unload`
+- native 和 js 之外的类型，由对应加载器自己决定
+
+native 插件卸载的过程：
+
+1. 状态更改为 `Unloading`
+2. 先把这个插件的 Hook 全部**挂起**，保证卸载期间不会再有调用进入插件的代码
+3. 在异常捕获下调用 `unload()`
+4. 如果 `unload()` 返回 `false` 或抛异常，并且这是一次主动卸载：**把 Hook 恢复回去，插件继续保持已加载**，返回 `CallbackFailed`
+5. 否则清理资源：撤掉 Hook，移除事件监听器，并**等待该插件的监听器都执行完**
+6. 最后关闭动态库，状态更改为 `Unloaded`，报告 `名字 unloaded`
+
+清理不完整的时候，动态库不会被关闭，状态变为 `Failed`，避免把还在被引用的代码移除掉。
+
+<Callout type="warn">
+  动态库在清理完成后会被真正关闭，地址空间内不再存在这个插件，  
+  所以 `unload()` 返回之后，不能再有任何代码跑在这个库里，所有自己开的线程、没停的定时器、还挂着的回调，都要在 `unload()` 里解决掉，否则后果很严重。
+</Callout>
+
+## 运行时加载与重载
+
+不是所有类型都能在运行时动态加载：
+
+| | native | js | 其他类型 |
+| --- | --- | --- | --- |
+| 启动时加载 | 可以 | 可以 | 可以，由加载器处理 |
+| 运行时加载 | **不可以**，`only JS plugins support hot load` | 可以 | 由加载器处理 |
+| 运行时卸载 | 需要定义 `unload()` | 可以 | 由加载器处理 |
+| 运行时重载 | **不可以**，`only JS plugins support reload` | 可以 | 由加载器处理 |
+
+也就是说，目前 **native 插件改完代码要重启 QQ**，它能热卸载，但没法再热加载回来。
+
+<Callout type="info">
+  我们正在解决 Native 插件无法热重载的问题。
+</Callout>
+
+JS 插件的重载就是"卸载再加载"。如果它带有 `preloadEntry` 或 `rendererEntry`，完成后会重新加载所有窗口。
+
+如果卸载阶段报错但加载阶段成功的话，只会记一条错误日志，重载仍算成功。
+
+热加载时同样要检查依赖：硬依赖的插件必须已经加载，否则会报告 `is missing dependency`。
+
+## 资源清理
+
+**框架会自动清理的：**
+
+<TypeTable
+  type={{
+    'Hook 和内存补丁': {
+      type: 'native',
+      description: '按所有者批量撤销。所有者默认是 load() / unload() 期间的当前插件',
+    },
+    事件监听器: {
+      type: 'native / js',
+      description: '按所有者批量移除，并等正在执行的监听器跑完',
+    },
+    'ctx 上注册的东西': {
+      type: 'js',
+      description: 'setTimeout、setInterval、app.on、ipcMain.on / handle、onHeadersReceived、events.on，卸载时按注册的相反顺序撤销',
+    },
+    'JS 模块缓存': {
+      type: 'js',
+      description: '该插件加载期间新进入缓存的模块会被清掉，下次加载会重新执行',
+    },
+  }}
+/>
+
+**你要自己清理的：**
+
+- 自己开的线程
+- 打开的文件、句柄、socket
+- 自己申请的内存
+- 没有经过 `ctx` 注册的东西，比如直接用 `ctx.electron` 创建的窗口
+
+<Tabs items={['C++', 'JavaScript']}>
+  <Tab value="C++">
+
+```cpp
+bool unload() {
+    mWorker.request_stop();
+    mWorker.join();     // 线程必须在这里停掉
+    return true;
+}
+```
+
+  </Tab>
+  <Tab value="JavaScript">
+
+```ts
+import { definePlugin } from '@clovernt/sdk';
+
+export default definePlugin({
+    onLoad(ctx) {
+        const socket = openSomething();
+
+        ctx.onUnload(() => socket.close());
+    },
+});
+```
+
+  </Tab>
+</Tabs>
+
+## 退出时
+
+QQ 退出时，CloverCore 会在 Electron 的 `before-quit` 里按**加载顺序的相反顺序**卸载全部插件，日志是 `Unloading plugins...`。
+
+退出过程中和主动卸载的区别是：不可恢复。某个插件的 `unload()` 失败了，也会强制清理，不会回滚。
+
+JS 插件在退出时，对象式的 `onUnload`、`ctx.onUnload` 和函数式入口返回的清理回调照常执行，但 `ctx` 上注册的定时器、IPC 处理器、`app.on` 监听这些自动清理会被跳过，因为这时整个环境已经在被关闭了。
+
+## 运行时管理插件
+
+C++ 用 `PluginManager`，JavaScript 用 `clovernt` 上的同名方法：
+
+<Cards>
+  <Card title="PluginManager（C++）" href="/docs/core/api/plugin" />
+  <Card title="CloverApi（JS）" href="/docs/core/js-api" />
+</Cards>
+
+插件名可以带类别前缀来指定类型：
+
+- native 插件是 `clover:名字`
+- js 插件是 `cloverjs:名字` 
+- 自定义类型是 `加载器 id:名字`。
+
+不带前缀时按名字查找。

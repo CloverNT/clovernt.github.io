@@ -1,0 +1,7 @@
+{
+  "root": true,
+  "title": "CloverCore",
+  "description": "Native / JavaScript 插件开发框架",
+  "icon": "Puzzle",
+  "pages": ["index", "getting-started", "plugins", "guides", "api", "js-api"]
+}

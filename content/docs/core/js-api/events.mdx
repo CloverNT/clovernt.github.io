@@ -1,0 +1,188 @@
+---
+title: 事件 API
+description: 监听、取消与发布事件
+icon: Radio
+status: wip
+---
+
+JS 的事件 API 是[具名事件](/docs/core/guides/events)在 JavaScript 一侧的入口，也是内建事件的出口。
+
+```ts title="拿到 events"
+const { events } = ctx;          // 推荐：监听器记在你的插件名下，卸载时自动移除
+const { events } = clovernt;     // 全局的：监听器记在 CloverCore 名下
+```
+
+## 接口
+
+<TypeTable
+  type={{
+    'on(name, callback)': {
+      type: 'number',
+      description: '订阅。返回监听器 id，失败返回 -1。callback 收到 (payload, control)',
+    },
+    'once(name, callback)': {
+      type: 'number',
+      description: '只触发一次，触发后自动移除。返回值同 on',
+    },
+    'off(id)': {
+      type: 'boolean',
+      description: '按 id 移除监听器。id 不存在返回 false',
+    },
+    'emit(name, payload?)': {
+      type: 'boolean',
+      description: '发布一个具名事件。返回值是**事件有没有被取消**，不是有没有人收到',
+    },
+  }}
+/>
+
+需要注意：
+
+- JS 监听器的优先级固定是 `Normal`，没法指定。
+- `callback` 的第二个参数 `control` 只有一个方法 `cancel()`。
+- 用 `ctx.events` 注册的，插件卸载时自动移除；用全局 `clovernt.events` 注册的，要自己 `off`。
+
+## 内建事件
+
+框架把几个 C++ 内建事件导出给了 JS，事件名和载荷如下。
+
+### dll-load
+
+一个模块被加载进进程时触发。
+
+<TypeTable
+  type={{
+    baseName: { type: 'string', description: '模块的文件名' },
+    fullPath: { type: 'string', description: '完整路径' },
+    baseAddress: {
+      type: 'string',
+      description: '基址，是 "0x7ff6..." 这样的十六进制字符串。不是数字，因为 64 位地址可能超过 JS 能精确表示的整数范围，要计算的话用 BigInt(payload.baseAddress)',
+    },
+    imageSize: { type: 'number', description: '映像大小，字节' },
+  }}
+/>
+
+### packet-send / packet-recv
+
+<TypeTable
+  type={{
+    seq: { type: 'number', description: '序列号' },
+    command: { type: 'string', description: '命令名' },
+    uin: { type: 'string', description: '数字账号，比如 "10001"' },
+    uid: { type: 'string', description: 'NT 账号 id（"u_..."）。在凭据捕获到之前是空字符串' },
+    encryption: { type: '"none" | "d2key" | "zero"', description: '加密方式，小写字符串，对应 C++ 的 Encryption 枚举' },
+    body: { type: 'string', description: '包体，**小写十六进制字符串**，没有 0x 前缀' },
+    injected: { type: 'boolean', description: '这个封包是不是 CloverCore 通过 clovernt.packet.send 自己发出去的' },
+  }}
+/>
+
+### o3-send / o3-recv
+
+<TypeTable
+  type={{
+    command: { type: 'string' },
+    body: { type: 'string', description: '包体，同样是小写十六进制字符串' },
+  }}
+/>
+
+### credential
+
+登录态就绪时触发。
+
+<Callout type="error">
+
+载荷里是登录凭据，等同于账号的控制权，**只应该在本机、在用户知情的前提下使用**。
+
+</Callout>
+
+用法和注意事项见[封包 API](/docs/core/js-api/packet)。
+
+<TypeTable
+  type={{
+    uin: { type: 'string', description: '数字账号' },
+    uid: { type: 'string', description: 'NT 账号 id（"u_..."）' },
+    a2: { type: 'string', description: '小写十六进制字符串' },
+    d2: { type: 'string', description: '小写十六进制字符串' },
+    d2Key: { type: 'string', description: '小写十六进制字符串，固定 16 字节 = 32 字符' },
+  }}
+/>
+
+<Callout type="warn">
+  事件载荷里的字节是十六进制**字符串**，而 `clovernt.packet` 直接给的是 `Uint8Array`，两条路径的数据形态不一样。
+  
+  互转的写法见[封包 API](/docs/core/js-api/packet)。
+</Callout>
+
+## 内建事件在 JS 里是只读的
+
+`control.cancel()` 对内建事件**不起作用**：这是设计。
+
+内建事件是 C++ 一侧发布的，到 JS 时只是一份 JSON 快照，取消一个已经发出去的封包或者一个已经收到的事件没有意义。
+
+也就是说，JS 能观察它们，但没法取消，也没法改载荷。
+
+想拦截或修改封包，要用 C++ 的[事件系统](/docs/core/guides/events)，在 Native 插件里订阅 `PacketSendEvent` / `PacketRecvEvent` 并修改封包体。
+
+## 自定义事件
+
+内建名字之外的任意字符串都可以当事件名，载荷是任何能转成 JSON 的值。
+
+```ts
+ctx.events.on('my-plugin:greet', (payload, control) => {
+  if (payload.who === 'blocked') {
+    control.cancel();
+  }
+});
+
+const cancelled = ctx.events.emit('my-plugin:greet', { who: 'world' });
+```
+
+自定义事件的取消**能**起作用，前提是事件由 JS 线程同步发布：
+
+<TypeTable
+  type={{
+    'JS 线程上 emit': {
+      type: '同步',
+      description: 'JS 监听器在 emit 里同步执行，拿到的 payload 就是你传进去的那个对象，监听器之间互相看得到对方对它的修改。cancel() 有效，emit 的返回值反映结果',
+    },
+    '其他线程（比如 C++ 的网络线程）发布': {
+      type: '异步',
+      description: 'JS 监听器被排进队列，稍后在 JS 线程上执行，拿到的是一份 JSON 快照。cancel() 没用',
+    },
+  }}
+/>
+
+### 载荷限制
+
+载荷要经过 JSON，所以：
+
+- 函数、Symbol、BigInt 会变成 `null`
+- 数字是 `double`，超过 2^53 的整数会丢精度，大整数请用字符串传
+
+C++ 一侧用 `onNamed` 收到的是载荷的 JSON 快照，不是你传的那个对象。
+
+### 自定义事件类型
+
+`CloverEventMap` 有一个字符串索引签名，任意事件名都能用，只是载荷类型是 `unknown`。
+
+想要类型提示的话，用模块增强补上：
+
+```ts
+declare module '@clovernt/sdk' {
+  interface CloverEventMap {
+    'my-plugin:greet': { who: string };
+  }
+}
+```
+
+模块名就写 `@clovernt/sdk`，和你 `import type` 时用的名字一致。
+
+## 清理
+
+要是用 `ctx.events` 的话就不用管。
+
+用全局 `clovernt.events` 的话，把 `on` 返回的 id 存下来，卸载时 `off`：
+
+```ts
+const ids = [clovernt.events.on('dll-load', onLoad), clovernt.events.on('dll-load', onLoadAgain)];
+ctx.onUnload(() => ids.forEach((id) => clovernt.events.off(id)));
+```

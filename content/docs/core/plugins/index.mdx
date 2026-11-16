@@ -1,0 +1,169 @@
+---
+title: 插件模型
+description: 选择适合你且匹配需求的插件类型
+icon: Blocks
+status: wip
+---
+
+清楚自身的定位才能方便做事，插件也同理。
+
+我们来看看一个插件至少都需要什么，以及都有哪些插件类型。
+
+## 一个插件是什么
+
+通常来说，一个插件存储在 `plugins/` 下的一个目录，里面有一份 `clover.json` 和入口文件。
+
+如下图：
+
+<Files>
+  <Folder name="plugins" defaultOpen>
+    <Folder name="CloverCore" />
+    <Folder name="MyNativePlugin" defaultOpen>
+      <File name="clover.json" />
+      <File name="MyNativePlugin.dll" />
+    </Folder>
+    <Folder name="MyJsPlugin" defaultOpen>
+      <File name="clover.json" />
+      <File name="main.cjs" />
+    </Folder>
+  </Folder>
+</Files>
+
+启动的时候CloverCore会对 `./plugins/` 进行扫描，建立依赖关系图和插件加载方案。
+
+## 插件类型
+
+插件的类型由 `clover.json` 里的 `type` 决定：
+
+<TypeTable
+  type={{
+    native: {
+      type: "原生动态链接库（.dll / .so）",
+      description:
+        "C++ 插件，由 CloverCore 加载。导出 clovernt_plugin_load，能用完整的 C++ API。",
+    },
+    js: {
+      type: "JavaScript 文件",
+      description:
+        "由 CloverCore 的 JS 运行时在 Electron 里执行。entry、preloadEntry、rendererEntry 至少声明一个",
+    },
+    raw: {
+      type: "共享库（由 CloverLoader 加载）",
+      description:
+        "没有入口函数，CloverLoader 只是把它 LoadLibrary / dlopen 进来，入口就是 DllMain 或 ELF 的 constructor。入口字段叫 main",
+    },
+  }}
+/>
+
+<Callout type='warn'>
+  通常来说任何插件都不应该使用 `raw` 类型，除非你知道你在做什么。  
+  为方便读者理解，下附 CloverLoader 关于此插件类型的加载代码：
+  ```cpp
+  void* loadLibrary(const std::filesystem::path& path) {
+  #if defined(CloverNT_SYSTEM_WINDOWS)
+    return ::LoadLibraryW(path.wstring().c_str());
+  #else
+    return ::dlopen(path.string().c_str(), RTLD_NOW | RTLD_GLOBAL);
+  #endif
+  }
+
+  std::size_t loadRawPlugins() {
+    const char\* dirRaw = CloverPluginsDirectory();
+    if (dirRaw == nullptr || dirRaw[0] == '\0') {
+      logWarn("plugins directory unknown; no raw plugins loaded.");
+      return 0;
+    }
+
+    const std::filesystem::path pluginsDir{dirRaw};
+    std::error_code             ec;
+    if (!std::filesystem::is_directory(pluginsDir, ec)) {
+        return 0;
+    }
+
+    std::size_t loaded = 0;
+    for (const auto& entry: std::filesystem::directory_iterator(pluginsDir, ec)) {
+        if (ec || !entry.is_directory()) {
+            continue;
+        }
+        const auto manifest = entry.path() / "clover.json";
+        if (!std::filesystem::exists(manifest, ec)) {
+            continue;
+        }
+        const auto json = slurp(manifest);
+        if (jsonStringField(json, "type") != "raw") {
+            continue;
+        }
+        const auto main = jsonStringField(json, "main");
+        if (main.empty()) {
+            logWarn("raw plugin '" + entry.path().filename().string() + "' has no \"main\"; skipped.");
+            continue;
+        }
+        const auto  library = entry.path() / main;
+        auto* const handle  = loadLibrary(library);
+        const auto  errText = handle != nullptr ? std::string{} : describeLoadError();
+        if (handle != nullptr) {
+            logInfo("loaded raw plugin: " + library.string());
+            ++loaded;
+        } else {
+            logWarn("failed to load raw plugin: " + library.string() + errText);
+        }
+    }
+    return loaded;
+  }
+
+```
+</Callout>
+
+CloverCore 自己就是一个 `raw` 插件。CloverCore 扫描插件目录时会直接跳过 `raw`。
+
+除了这些内建类型外，`type`字段也可以是任意字符串，在加载这些标准插件后会寻找与之对应的插件加载器，并交由他们进行加载。
+
+<Callout type="info">
+  你可以参考 [`PluginManager::registerLoader`](/docs/core/api/plugin) 来了解如何注册一个插件加载器。
+</Callout>
+
+
+如果此时找不到对应的加载器，CloverCore会报告错误 `no loader registered for type`。
+
+所以注册加载器的插件要排在它们前面，通常用 `dependencies` 来保证。
+
+## 该选哪种
+
+| | native | js |
+| --- | --- | --- |
+| 语言 | C++23+ | JavaScript / TypeScript |
+| Hook 原生函数 | 可以 | 不可以 |
+| 读写内存、扫特征码 | 可以 | 不可以 |
+| 监听内建事件 | 可以，也能取消、修改 | 只能观察 |
+| 改界面、拦截 Electron 请求 | 不方便 | 可以，这是它的主场 |
+| 运行时加载 | 不可以，只在启动时加载 | 可以 |
+| 运行时卸载 | 定义了 `unload()` 才可以 | 可以 |
+| 运行时重载 | 不可以 | 可以 |
+| QQ 更新后的适配成本 | 一般较高 | 一般极少 |
+
+通常来说。只要碰原生函数或者内存，就该用 `native`。
+
+如果只是改界面、加功能、拦网络请求，做点美化，那用 `js`，开发和调试都快得多。
+
+两种可以搭配：native 插件做底层，js 插件做上层，中间通过[事件系统](/docs/core/guides/events)通信。
+
+<Callout type="info">
+  我们正在计划设计一种混合式插件，其中可以包含子插件，并将它们作为一个整体管理。  
+  这种类型的好处是既需要底层功能，又要有 UI 提供的插件无需声明为两个插件。
+</Callout>
+
+## 插件之间的关系
+
+在 clover.json 内可用 `dependencies`、`optionalDependencies`、`conflicts` 和 `loadBefore` 四个字段声明插件之间的关系。
+
+具体的参考请参见[clover.json 清单](/docs/core/plugins/manifest)。
+
+## 接下来
+
+<Cards>
+  <Card title="clover.json 清单" href="/docs/core/plugins/manifest" />
+  <Card title="开发 Native 插件" href="/docs/core/plugins/native" />
+  <Card title="开发 JavaScript 插件" href="/docs/core/plugins/javascript" />
+  <Card title="插件生命周期" href="/docs/core/plugins/lifecycle" />
+</Cards>
+```

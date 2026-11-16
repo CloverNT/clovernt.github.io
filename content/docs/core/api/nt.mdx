@@ -1,0 +1,264 @@
+---
+title: Nt
+description: 网络包结构、编解码与收发接口
+icon: Send
+---
+
+<Callout type="error">
+  **使用这些 API 之前，确保知道你在做什么，以及面临着什么风险。**
+</Callout>
+
+```cpp title="引入"
+#include <CloverNT/API/Nt/Packet.hpp>
+```
+
+命名空间 `CloverNT::Nt`。全部类型和函数都定义在头文件里，无需链接额外库。
+
+这个头文件本身也依赖 `CloverNT/Runtime/Nt.h`（由 CloverLoader SDK 提供）。
+
+## 基础类型
+
+<TypeTable
+  type={{
+    Bytes: {
+      type: 'std::vector<std::uint8_t>',
+      description: '原始字节载荷。收发接口统一使用它',
+    },
+    Encryption: {
+      type: 'enum class : std::uint8_t',
+      description: 'SSO 网络包体的加密方式，取值 None (0) / D2Key (1) / ZeroKey (2)',
+    },
+    kDefaultTimeout: {
+      type: 'constexpr std::chrono::milliseconds{5000}',
+      description: 'receive / call 的默认超时',
+    },
+  }}
+/>
+
+### Packet
+
+SSO 网络包。收到的 `body` 是解密后的明文，发送时也写明文，重加密由下游处理。
+
+<TypeTable
+  type={{
+    'seq': { type: 'std::uint32_t', description: '序列号' },
+    'command': { type: 'std::string', description: '命令名，例如 "trpc.msg.olpush.OlPushService.MsgPush"' },
+    'uin': { type: 'std::string', description: '数字账号，例如 "10001"' },
+    'encryption': { type: 'Encryption', description: '收到时填实际加密方式；发送时底层会按通道填' },
+    'body': { type: 'Bytes', description: '包体字节，通常是 protobuf 序列化结果' },
+    'injected': {
+      type: 'bool',
+      description: 'true 表示这个网络包是 CloverCore 自己通过 Nt::send 发出去的（仅发送方向），用来区分是不是插件自己发的',
+    },
+    'uid': {
+      type: 'std::string',
+      description: 'NT 账号 id（"u_..."）。',
+    },
+  }}
+/>
+
+<Callout type="warn">
+  Packet 的内存布局是 ABI 的一部分。  
+  新字段原则上**只能追加在末尾**，不能插进中间，否则按旧头文件编译的插件会按错误的偏移读写。
+</Callout>
+
+### O3Packet
+
+O3 网络包。字段比 SSO 少，没有 `seq`、`uin` 和 `encryption`。
+
+<TypeTable
+  type={{
+    'command': { type: 'std::string' },
+    'body': { type: 'Bytes' },
+  }}
+/>
+
+### Credential
+
+登录凭据。
+
+<TypeTable
+  type={{
+    'uin': { type: 'std::string', description: '数字账号' },
+    'uid': { type: 'std::string', description: 'NT 账号 id（"u_..."）。' },
+    'a2': { type: 'Bytes', description: '长期凭据' },
+    'd2': { type: 'Bytes', description: '会话凭据' },
+    'd2Key': { type: 'std::array<std::uint8_t, 16>', description: '会话密钥，固定 16 字节' },
+  }}
+/>
+
+<Callout type="error">
+  **这几项加起来等同于账号的完整控制权**，任何把它写入文件或发往远端的行为都应被视为恶意。
+</Callout>
+
+## Events 命名空间
+
+把网络包事件桥接到强类型事件总线时所用到的运行时事件名字符串常量，定义在 `CloverNT::Nt::Events` 里：`kSsoSend`、`kSsoRecv`、`kO3Send`、`kO3Recv`、`kCredential`。
+
+普通插件不会直接用到它们，想**完全接管**这些事件（不通过事件总线订阅）可以直接 `CloverEventSubscribe` 这些名字。
+
+绝大多数插件应该订阅强类型的 [`PacketSendEvent` / `PacketRecvEvent`](/docs/core/api/events) 等。
+
+## 编解码
+
+命名空间 `CloverNT::Nt::Codec`。这几个函数是网络包与字节流之间的转换，主要给跨语言桥和持久化使用。普通插件通常用不到它们。
+
+<TypeTable
+  type={{
+    'encodePacket(packet)': { type: 'Bytes', description: '把 Packet 序列化成字节流' },
+    'decodePacket(data)': {
+      type: 'std::optional<Packet>',
+      description: '从字节流反序列化出 Packet，失败返回 nullopt。原因一般有：流过短、长度前缀超过 64 MiB 上限、uin 段非法 UTF-8 等',
+    },
+    'encodeO3(packet)': { type: 'Bytes' },
+    'decodeO3(data)': { type: 'std::optional<O3Packet>' },
+    'encodeCredential(credential)': { type: 'Bytes' },
+    'decodeCredential(data)': { type: 'std::optional<Credential>' },
+  }}
+/>
+
+字段布局是私有协议，不要依赖它和服务端或旧版本的二进制兼容。
+
+<TypeTable
+  type={{
+    'kMaxField': {
+      type: 'constexpr std::uint32_t{64 * 1024 * 1024}',
+      description: 'decode 单个长度字段的上限（64 MiB），超过就按损坏处理',
+    },
+  }}
+/>
+
+## 收发
+
+命名空间 `CloverNT::Nt`。这些都是对 CloverLoader 运行时 C 接口的轻封装，所以能在任何线程调用。
+
+### ready()
+
+```cpp
+[[nodiscard]] auto ready() -> bool;
+```
+
+发包路径是否已经就绪。`false` 表示 CloverLoader 还没有在 `wrapper.node` 内发现 session 被创建。
+
+### credential()
+
+```cpp
+[[nodiscard]] auto credential() -> std::optional<Credential>;
+```
+
+读取最近一次捕获到的凭据，不触发事件。登录完成之前返回 `std::nullopt`。
+
+<Callout type="error">
+  同样是凭据读取接口。使用守则见上面的 [Credential](#credential) 部分。
+</Callout>
+
+### send()
+
+```cpp
+[[nodiscard]] auto send(std::string_view command, std::span<const std::uint8_t> body)
+        -> std::optional<std::uint32_t>;
+```
+
+发送一个 SSO 网络包，不等响应。
+
+- 返回值：CloverLoader 从底层路径截到的序列号。**拿到序列号是通常情况，但不保证**。
+- 失败：`ready() == false` 或 `wrapper.node` 一侧把这次发送拒绝时返回 `std::nullopt`。
+
+### receive()
+
+```cpp
+[[nodiscard]] auto receive(std::string_view command,
+                           std::chrono::milliseconds timeout = kDefaultTimeout)
+        -> std::optional<Packet>;
+
+[[nodiscard]] auto receive(std::uint32_t seq,
+                           std::chrono::milliseconds timeout = kDefaultTimeout)
+        -> std::optional<Packet>;
+```
+
+同步阻塞直到收到一个匹配的网络包，或者超时。`std::nullopt` 既可能是超时也可能是接口不可用。
+
+- 按**序号**等：返回下一条序号匹配的网络包。
+- 按**命令名**等：返回下一条命令名匹配的网络包，适合订阅型推送。
+
+<Callout type="error">
+  **阻塞的是调用线程**。
+  
+  绝不要在 UI 线程、Hook 的 detour、或任何网络包事件的回调里调用。  
+  请参见[网络包](/docs/core/guides/packets) 指南里的线程注意事项。
+</Callout>
+
+### call()
+
+```cpp
+[[nodiscard]] auto call(std::string_view command,
+                        std::span<const std::uint8_t> body,
+                        std::chrono::milliseconds timeout = kDefaultTimeout)
+        -> std::optional<Packet>;
+```
+
+`send` 加 `receive` 的组合，最常用的"调用式发送"写法。
+
+能拿到序号时使用序号等响应，拿不到序号时退回按命令名等响应。
+
+它的阻塞语义和 `receive` 一致。
+
+## 完整示例
+
+```cpp
+#include <CloverNT/API/Events/EventBus.hpp>
+#include <CloverNT/API/Nt/Packet.hpp>
+#include <CloverNT/API/Plugin/PluginBase.hpp>
+#include <CloverNT/API/Plugin/RegisterHelper.hpp>
+
+#include <thread>
+
+using namespace CloverNT;
+
+class MyPlugin : public Plugin::PluginBase {
+public:
+    bool load() {
+        auto listener = Event::EventBus::getInstance().emplaceListener<Event::CredentialEvent>(
+                [this](Event::CredentialEvent&) { onCredential(); });
+        return listener.has_value();
+    }
+
+    bool unload() {
+        if (mWorker.joinable()) {
+            mWorker.join();
+        }
+        return true;
+    }
+
+private:
+    std::jthread mWorker;
+
+    void onCredential() {
+        if (mWorker.joinable()) {
+            return;
+        }
+        // 把阻塞的 call() 派发到工作线程。owner 不用管，jthread 的生命周期由 unload() 控制
+        mWorker = std::jthread([this](std::stop_token stop) {
+            if (!Nt::ready() || stop.stop_requested()) {
+                return;
+            }
+            const Nt::Bytes body = encodeRequest();
+            if (const auto response = Nt::call("SomeService.Call", body, std::chrono::seconds{3})) {
+                logger().info("got response: {} bytes", response->body.size());
+            } else {
+                logger().warn("request timed out or interface unavailable");
+            }
+        });
+    }
+};
+
+CloverNT_REGISTER_PLUGIN(MyPlugin)
+```
+
+## 参考
+
+<Cards>
+  <Card title="网络包指南" href="/docs/core/guides/packets" description="使用守则、事件语义与线程规则。" />
+  <Card title="事件 API 参考" href="/docs/core/api/events" description="PacketSendEvent / PacketRecvEvent 等事件类。" />
+  <Card title="CloverLoader Nt.h" href="/docs/loader/reference/nt" description="底层 C ABI，Nt::Packet 就是基于它实现的。" />
+</Cards>

@@ -1,0 +1,218 @@
+---
+title: 网络包 API
+description: 在 JavaScript 侧收发网络包
+icon: Send
+---
+
+`clovernt.packet` 是 JavaScript 一侧的直接收发接口。
+
+和[事件桥](/docs/core/js-api/events)不同，它的字节字段都是 `Uint8Array`，并且支持主动发送。
+
+它只在**主进程**可用，渲染进程和 preload 都没有 `packet`。
+
+```ts
+import type { Packet, Credential } from '@clovernt/sdk';
+
+const { packet } = ctx;                 // 推荐
+const packet = clovernt.packet;         // 全局入口，等价
+```
+
+<Callout type="error">
+  **插件不应该在用户不知情的情况下收发网络包或读取登录凭据**。  
+  详见[网络包指南](/docs/core/guides/packets)。
+</Callout>
+
+## 接口
+
+<TypeTable
+  type={{
+    'ready()': {
+      type: 'boolean',
+      description: '发包路径是否就绪。登录完成之前是 false',
+    },
+    'credential()': {
+      type: 'Credential | undefined',
+      description: '读取最近一次捕获到的登录凭据。登录完成前是 undefined。获取前确保知道你在做什么',
+    },
+    'send(command, body)': {
+      type: 'number | undefined',
+      description: '发送一个 SSO 网络包并返回序列号。undefined 表示没能截到序列号，这种情况下网络包仍可能发了出去',
+      parameters: [
+        { name: 'command', description: '命令名字符串' },
+        { name: 'body', description: '包体 Uint8Array（明文）' },
+      ],
+    },
+    'call(command, body, timeoutMs)': {
+      type: 'Packet | undefined',
+      description: '发送并等待响应，返回 undefined 表示超时或接口不可用。timeoutMs <= 0 表示用默认超时 5000 毫秒',
+    },
+    'receive(command, timeoutMs)': {
+      type: 'Packet | undefined',
+      description: '按命令名等待下一条匹配的接收网络包。适合订阅型推送',
+    },
+    'receiveSeq(seq, timeoutMs)': {
+      type: 'Packet | undefined',
+      description: '按序号等待响应。通常配合 send 使用',
+    },
+  }}
+/>
+
+<Callout type="error">
+  `call` / `receive` / `receiveSeq` 是**同步阻塞**的，它们会卡住 JS 主线程 `timeoutMs` 毫秒（默认 5 秒），同时 QQ 的渲染、IPC 全都会停。
+
+  **别在 JS 主线程上直接调用。**  
+  直接写 `clovernt.packet.call(...)` 在插件加载、IPC 处理器或者定时器回调里都会卡住整个 UI。  
+
+  推荐做法有两条：
+  - **被动监听用事件桥**，订阅 `packet-recv` 事件自己匹配
+  - **主动请求用 `deasync`**（见下）。
+</Callout>
+
+## 返回的 Packet / Credential
+
+两者都是 Alka 生成的只读类，字段和 C++ 侧对应（见 [Nt API 参考](/docs/core/api/nt)）：
+
+<TypeTable
+  type={{
+    'Packet.seq': { type: 'number' },
+    'Packet.command': { type: 'string' },
+    'Packet.uin': { type: 'string', description: '数字账号' },
+    'Packet.uid': { type: 'string', description: 'NT 账号 id。' },
+    'Packet.encryption': { type: 'Encryption', description: '枚举：None / D2Key / ZeroKey' },
+    'Packet.body': { type: 'Uint8Array', description: '明文包体' },
+  }}
+/>
+
+<TypeTable
+  type={{
+    'Credential.uin': { type: 'string' },
+    'Credential.uid': { type: 'string' },
+    'Credential.a2': { type: 'Uint8Array' },
+    'Credential.d2': { type: 'Uint8Array' },
+    'Credential.d2Key': { type: 'Uint8Array', description: '固定 16 字节' },
+  }}
+/>
+
+`Encryption` 的数值：
+
+<TypeTable
+  type={{
+    None: { type: '0' },
+    D2Key: { type: '1' },
+    ZeroKey: { type: '2' },
+  }}
+/>
+
+## 与事件桥的区别
+
+`clovernt.packet` 和 `events.on('packet-send' / 'packet-recv')` 是两条独立的路径：
+
+| | 事件桥 | 直接 API |
+| --- | --- | --- |
+| 包体 | `string`，小写十六进制（无 `0x` 前缀） | `Uint8Array` |
+| 凭据字节 | `string`，小写十六进制 | `Uint8Array` |
+| 方向 | 发送和接收都能观察 | 主动发送、主动查询、主动等待 |
+| 能不能修改 | **不能**，内建事件在 JS 里是只读的 | 只能发自己的包 |
+| 阻塞 | 否（监听器异步排到 JS 线程） | `call` / `receive` / `receiveSeq` 同步阻塞 |
+| 典型用途 | 被动监听、分析流量 | 主动调用 |
+
+**修改网络包只能在 C++ 侧做**，见[网络包指南](/docs/core/guides/packets#修改或取消)。
+
+### hex 与 Uint8Array 互转
+
+```ts
+const fromHex = (hex: string): Uint8Array =>
+    new Uint8Array(hex.match(/.{2}/g)?.map((byte) => parseInt(byte, 16)) ?? []);
+
+const toHex = (bytes: Uint8Array): string =>
+    [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+```
+
+## 示例
+
+### 被动监听
+
+```ts
+import { definePlugin } from '@clovernt/sdk';
+
+export default definePlugin({
+    onLoad(ctx) {
+        ctx.events.on('packet-recv', (packet) => {
+            if (packet.command !== 'trpc.msg.olpush.OlPushService.MsgPush') {
+                return;
+            }
+            ctx.logger.info(`push: seq=${packet.seq}, body=${packet.body.length / 2} bytes`);
+        });
+    },
+});
+```
+
+### 主动请求 / 响应（用 deasync）
+
+`deasync` 能同步等一个 Promise，等待期间事件循环仍在转，UI 不冻结。
+
+把阻塞的 `call` 放进一个 Worker Thread 或者包成 Promise，再用 `deasync.await` 等它。
+
+注意不要直接 `deasync.await(call(...))`，因为 `call` 本身就是同步的。
+
+```ts
+import { definePlugin, clovernt } from '@clovernt/sdk';
+import { Worker } from 'node:worker_threads';
+
+// 真实工程里把 Worker 放在插件目录里单独一个文件，这里只做示意：
+function callAsync(command: string, body: Uint8Array, timeoutMs: number): Promise<Packet | undefined> {
+    return new Promise((resolve) => {
+        // 在工作线程里跑阻塞调用，避免卡住主线程
+        // ...
+    });
+}
+
+export default definePlugin({
+    onLoad(ctx) {
+        ctx.events.on('credential', () => {
+            if (!clovernt.packet!.ready()) return;
+
+            const body = encodeRequest();
+            // 用 deasync 把事件循环让出来，等异步结果同步地拿到
+            const response = clovernt.deasync!.await(callAsync('SomeService.Call', body, 3000));
+            if (response) {
+                ctx.logger.info(`got response: ${response.body.length} bytes`);
+            }
+        });
+    },
+});
+```
+
+<Callout type="warn">
+  `clovernt.deasync.loopWhile` / `await` **会让事件循环重入**
+  
+  你阻塞在这里的时候，别的 JS 回调可能已经改动了你正在用的状态。  
+  所以能用 `async` / `await` 的场景不要用 deasync。
+  
+  参见 [JS SDK 参考里的 deasync](/docs/core/js-api#deasync) 一节。
+</Callout>
+
+### 调用式发送（接受阻塞）
+
+某些场景下允许 UI 阻塞一下，比如启动阶段的初始化请求、用户主动触发的一次性操作。
+
+可以直接用 `call`，但尽量把 `timeoutMs` 调小。
+
+```ts
+ctx.events.on('credential', () => {
+    if (!clovernt.packet!.ready()) return;
+
+    const response = clovernt.packet!.call('SomeService.Init', encodeRequest(), 1500);
+    if (response) {
+        ctx.logger.info(`init ok: ${response.body.length} bytes`);
+    }
+});
+```
+
+## 参考
+
+<Cards>
+  <Card title="网络包指南" href="/docs/core/guides/packets" description="两种通道、修改、线程注意事项。" />
+  <Card title="Nt API 参考（C++）" href="/docs/core/api/nt" description="JS 这一套的类型、语义都来自那里。" />
+  <Card title="JS 事件 API" href="/docs/core/js-api/events" description="packet-send / packet-recv / credential 事件。" />
+</Cards>

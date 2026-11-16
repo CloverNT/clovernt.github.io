@@ -1,0 +1,266 @@
+---
+title: 事件系统
+description: 发布与监听事件，以及使用跨语言事件
+icon: Radio
+status: wip
+---
+
+事件系统是 CloverCore 里用得最多，也是最实用的东西。
+
+## 事件类型
+
+<Tabs items={['强类型事件', '具名事件']}>
+  <Tab value="强类型事件">
+
+  一个继承 `Event::Event` 的 C++ 类，事件名是类里的 `kEventName` 常量，载荷就是这个类的成员。
+
+  适合只在 C++ 里用的事件：类型安全，没有序列化开销，监听器拿到的是你定义的类型。
+
+  </Tab>
+  <Tab value="具名事件">
+
+  事件名是运行时的字符串，载荷是一份 JSON。
+
+  适合要跨语言的事件：C++ 和 JavaScript 之间的互通就靠它。
+  
+  代价是载荷要经过 JSON 序列化。
+
+  </Tab>
+</Tabs>
+
+## 内建事件
+
+框架自带如下几个事件（他们都是强类型的）：
+
+<TypeTable
+  type={{
+    DllLoadEvent: {
+      type: 'CloverNT.DllLoadEvent',
+      description: '一个模块被加载进进程时触发。可以取到 baseName()、fullPath()、baseAddress()、imageSize()。不可取消',
+    },
+    PacketSendEvent: {
+      type: 'CloverNT.PacketSend',
+      description: 'SSO 网络包发出前。可取消',
+    },
+    PacketRecvEvent: {
+      type: 'CloverNT.PacketRecv',
+      description: 'SSO 网络包收到时。可取消',
+    },
+    O3SendEvent: {
+      type: 'CloverNT.O3Send',
+      description: 'O3 网络包发出前。可取消',
+    },
+    O3RecvEvent: {
+      type: 'CloverNT.O3Recv',
+      description: 'O3 网络包收到时。可取消',
+    },
+    CredentialEvent: {
+      type: 'CloverNT.Credential',
+      description: '登录态就绪时触发。不可取消',
+    },
+  }}
+/>
+
+网络包和凭据相关的事件，用法见[网络包](/docs/core/guides/packets)。
+
+## 监听事件
+
+```cpp
+using namespace CloverNT;
+
+bool load() {
+    auto listener = Event::EventBus::getInstance().emplaceListener<Event::DllLoadEvent>(
+            [this](Event::DllLoadEvent& event) {
+                logger().info("module loaded: {}", event.baseName());
+            });
+
+    if (!listener) {
+        logger().error("listen failed: {}", listener.error().message);
+        return false;
+    }
+    return true;
+}
+```
+
+有几点要注意：
+
+- `emplaceListener`、`addListener` 和 `publish` 的强类型版本都是**成员函数**，要通过 `EventBus::getInstance()` 调用。
+- 返回的是 `Expected`，必须检查。最常见的失败是 `No current plugin is available`，参见下文的"所有者"。
+- 事件总线自己持有监听器，返回的 `shared_ptr` 无需存储。
+- 监听器在发布事件的那个线程上**同步**执行，例如`DllLoadEvent` 就是在加载模块的线程上触发的，所以不要在回调里做耗时的事。
+
+<Callout type="info">
+  模块加载事件**只告诉你之后发生的加载**。
+  
+  想等某个模块出现，先用 [`findModule`](/docs/core/guides/memory) 看它是不是已经加载了，没有再等事件。
+</Callout>
+
+
+### 所有者
+
+监听器和 Hook 一样，会记在某个插件名下，卸载时按所有者自动移除。
+
+所有者默认取"当前插件"，它只在 `load()` 和 `unload()` 期间有值。
+
+所以在**事件回调里再注册监听器**，或者在自己开的线程里注册，都要这样显式传：
+
+```cpp
+std::weak_ptr<Plugin::Plugin> mOwner;   // 成员变量
+
+bool load() {
+    mOwner = Plugin::PluginManager::currentPlugin();   // 只有在 load() 里取得到
+    // ...
+}
+
+Event::EventBus::getInstance().emplaceListener<Event::DllLoadEvent>(
+        callback, Event::EventPriority::Normal, mOwner);
+```
+
+## 优先级
+
+`EventPriority` 一共六级，**数值越大越先执行**：
+
+<TypeTable
+  type={{
+    Monitor: { type: '5', description: '最先执行，约定上只观察不修改' },
+    Highest: { type: '4' },
+    High: { type: '3' },
+    Normal: { type: '2', description: '默认值' },
+    Low: { type: '1' },
+    Lowest: { type: '0', description: '最后执行' },
+  }}
+/>
+
+同一级里，先注册的先执行。
+
+<Callout type="info">
+  和不少事件框架相反，`Monitor` 在这里是**最先**执行的，`Lowest` 才是最后。
+</Callout>
+
+## 取消事件
+
+继承了 `Cancellable` 的事件可以被取消：
+
+```cpp
+[](Event::PacketSendEvent& event) {
+    if (shouldBlock(event)) {
+        event.setCancelled(true);
+    }
+}
+```
+
+取消之后，**后面的监听器不会再被调用**。事件总线每次调用监听器之前都会检查一次，发现已取消就不再继续。
+
+取消到底意味着什么，由事件的发布方决定。
+
+## 发布事件
+
+<Tabs items={['强类型', '具名']}>
+  <Tab value="强类型">
+
+定义一个事件类。事件名原则上要带上插件名做前缀做命名空间隔离：
+
+```cpp
+class GreetEvent final : public Event::Event, public Event::Cancellable {
+public:
+    static constexpr std::string_view kEventName = "MyPlugin.Greet";
+
+    explicit GreetEvent(std::string who) : who(std::move(who)) {}
+    std::string who;
+};
+```
+
+发布：
+
+```cpp
+GreetEvent event{"world"};
+Event::EventBus::getInstance().publish(event);
+
+if (event.isCancelled()) {
+    // 有监听器取消了它
+}
+```
+
+`publish` 是同步的，返回时所有监听器都已经跑完。
+
+事件不用提前注册，第一次有人监听它的时候会自动创建。
+
+想让事件归你的插件所有，可以这样在 `load()` 里显式注册：
+
+```cpp
+(void) Event::EventBus::registerEvent<GreetEvent>();
+```
+
+<Callout type="warn">
+  事件的所有者被卸载时，**事件本身会被整个移除，别的插件挂在上面的监听器也会跟着消失**。  
+  如果事件会被别的插件监听，可以用 `EventBus::registerEvent(name, PluginManager::getPlugin("CloverCore"))` 把它挂在 CloverCore 名下，具名事件就是这么做的。
+</Callout>
+
+  </Tab>
+  <Tab value="具名">
+
+一行就够：
+
+```cpp
+const bool cancelled = Event::emitNamed("MyPlugin.Greet", nlohmann::json{{"who", "world"}});
+```
+
+注意返回值是**事件是否被取消**，不是"有没有人收到"。
+
+监听：
+
+```cpp
+auto listener = Event::onNamed("MyPlugin.Greet", [](Event::NamedEvent& event) {
+    const auto who = event.payload().value("who", "");
+    // event.setCancelled(true);
+});
+```
+
+具名事件继承了 `Cancellable`，所以同样可以取消。
+
+  </Tab>
+</Tabs>
+
+## 跨语言
+
+具名事件是 C++ 和 JavaScript 互通的桥梁：
+
+- C++ 用 `emitNamed` 发的，JS 用 `events.on` 能收到
+- JS 用 `events.emit` 发的，C++ 用 `onNamed` 能收到。
+
+载荷经过 JSON，所以有几条限制：
+
+- 函数、Symbol、BigInt 传不过去，会变成 `null`
+- 数字在 JS 一侧是 `double`，超过 2^53 的整数会丢精度。这也是内建事件里地址之类的值用字符串传递的原因
+
+**取消能不能跨语言，取决于事件是在哪个线程发布的：**
+
+<TypeTable
+  type={{
+    'JS 线程上发布': {
+      type: '同步',
+      description: 'JS 监听器在发布时同步执行，拿的到取消用的 control，取消对发布方有效',
+    },
+    '其他线程上发布': {
+      type: '异步',
+      description: 'JS 监听器被排进队列，稍后在 JS 线程上执行，拿到的是一份 JSON 快照，取消不了，也改不了载荷',
+    },
+  }}
+/>
+
+内建事件在 JS 里是**只读**的：JS 能观察它们，但是取消不了。
+
+详见 [JS 事件 API](/docs/core/js-api/events)。
+
+## 清理
+
+监听器按所有者自动移除，一般不用管。
+
+如果你想在卸载之前主动移除一个，可以用 `EventBus::removeListener`，参数是 `emplaceListener` 返回的监听器，或者它的 id。
+
+## 参考
+
+<Cards>
+  <Card title="Events API 参考" href="/docs/core/api/events" />
+  <Card title="JS 事件 API" href="/docs/core/js-api/events" />
+</Cards>

@@ -1,0 +1,246 @@
+---
+title: 清单文件
+description: 关于 clover.json
+icon: Braces
+status: wip
+---
+
+按照约定，每个插件都需要一个名为clover.json的清单文件来描述自身。
+
+## 最小示例
+
+```jsonc title="clover.json"
+{
+  "name": "MyPlugin", // 这个插件的名字
+  "type": "native",   // 插件的类型
+  "entry": "MyPlugin.dll" // 插件的入口点，由 type 字段对应的加载器约定
+}
+```
+
+## 清单的解析
+
+在最开始的时候，CloverLoader会加载并解析插件目录下的插件，并只挑选 `type` 为 `raw` 的插件进行加载。
+
+对于 `raw` 类型的插件，必须声明 `main` 字段，此字段指向的文件将会被加载。
+
+而对于`native`和`js`类型的插件，他们由`CloverCore`负责加载。
+
+CloverCore 的清单为编译期生成的:
+
+- `version` 由构建时版本决定
+- `main` 在 Windows 上是 `CloverCore.dll`，Linux 上是 `CloverCore.so`（没有 `lib` 前缀）。
+
+插件模板提供的设施内，清单文件的平台特异项也是编译期生成的。
+
+## 必填字段
+
+<TypeTable
+  type={{
+    name: {
+      type: 'string',
+      required: true,
+      description: '插件名，必须和插件所在的目录名完全一致，并且大小写敏感。',
+    },
+    type: {
+      type: 'string',
+      required: true,
+      description: '插件类型，native、js、raw 为内建类型。',
+    },
+  }}
+/>
+
+以上的字段均不可留空。
+
+对于`name`，字段名必须与当前清单文件所处的文件夹名字保持一致，否则插件不会被加载。
+
+对于`type`，类型如果非内建类型，需保证有注册了此类型的加载器并且在此插件之前被加载，否则也无法加载。
+
+## 入口字段
+
+入口字段取决于加载器的类型，此处只讲解内建类型。
+
+对于内建类型，总共有三个入口字段，它们是否必填取决于 `type`：
+
+| type | `entry` | `preloadEntry` | `rendererEntry` |
+| --- | --- | --- | --- |
+| `native` | 必填 | 不读取 | 不读取 |
+| `js` | 可选 | 可选 | 可选，**三个至少要有一个** |
+
+<TypeTable
+  type={{
+    entry: {
+      type: 'string',
+      description: '入口文件，是插件目录为起点的相对路径。',
+    },
+    preloadEntry: {
+      type: 'string',
+      description: '仅 js。在 Electron 的 preload 阶段执行',
+    },
+    rendererEntry: {
+      type: 'string',
+      description: '仅 js。在渲染进程的页面里执行',
+    },
+    main: {
+      type: 'string',
+      description: '仅 raw，由 CloverLoader 读取',
+    },
+  }}
+/>
+
+以上的全部字段都不能是绝对路径，且不能指到插件目录之外，文件必须存在。
+
+`native` 字段因为平台差异，故在两个平台上文件名不同（MyPlugin.dll 与 MyPlugin.so）。
+
+插件模板的做法是把清单写成 `clover.json.in`，构建器再由 CMake 把平台和文件名填进去，就不用手写两份了。
+
+## 可选字段
+
+<TypeTable
+  type={{
+    version: {
+      type: 'string',
+      description: '格式为 major.minor.patch 三段非负整数。',
+    },
+    author: { type: 'string' },
+    description: { type: 'string' },
+    platform: {
+      type: '"windows" | "linux" | "any"',
+      description: '用来限定平台。省略、空字符串或 "any" 表示不限。',
+    },
+    passive: {
+      type: 'boolean',
+      default: 'false',
+      description: '被动插件。默认不会被加载，只有被别的插件依赖时才会加载',
+    },
+    extraInfo: {
+      type: 'object',
+      description: '自定义键值对，值必须是 string。',
+    },
+  }}
+/>
+
+`version` 字段不支持 -beta 等这样的后缀，空字符串或 "*" 等同于没写。这些版本号会用在依赖的版本比较和启动日志里。
+
+CloverCore 本身不读取 `extraInfo` ，插件可以通过 manifest().extraInfo 取，此字段的用处是定义一个扩展字段用来给其他插件使用。
+
+## 依赖关系
+
+下面四个字段的形状一样，都为 `{ "插件名": "版本要求" }`：
+
+```json
+{
+  "dependencies": { "CloverCore": "0.0.1", "SomeLib": "1.2.0" },
+  "optionalDependencies": { "Extras": "*" },
+  "conflicts": { "OldVersionOfMe": "*" },
+  "loadBefore": { "LateComer": "*" }
+}
+```
+
+版本要求写 `"*"`、空字符串或 `null` 均表示不限版本。
+
+### 版本比较
+
+**主版本号必须相同，并且不低于要求的版本。**
+
+例如有一个插件要求 `1.2.0`：
+
+| 现有的版本 | 结果 |
+| --- | --- |
+| `1.2.0` | 满足 |
+| `1.5.3` | 满足 |
+| `1.1.9` | 不满足，低于要求 |
+| `2.0.0` | 不满足，主版本不同 |
+| 没写 version | 不满足 |
+
+通常不需要依赖 `CloverCore`，因为它在启动时期早就被 CloverLoader 加载了。
+
+### 字段的用处
+
+<TypeTable
+  type={{
+    dependencies: {
+      type: 'object',
+      description: '硬依赖。缺失或版本不满足，本插件会被跳过; 依赖本身加载失败，本插件也会失败。另外只要有已加载的插件依赖着它，它就不能被卸载。',
+    },
+    optionalDependencies: {
+      type: 'object',
+      description: '软依赖。对方存在且版本满足时，保证它先加载；不存在则没有影响。',
+    },
+    conflicts: {
+      type: 'object',
+      description: '互斥。对方也被选中加载时，声明了 conflicts 的这一方被跳过，对方不受影响。没写版本要求，或者对方没有版本号，都算冲突。',
+    },
+    loadBefore: {
+      type: 'object',
+      description: '反向排序：要求本插件排在列出的插件之前加载。对方不存在或版本不满足时忽略。',
+    },
+  }}
+/>
+
+### 加载顺序
+
+CloverCore 先按依赖关系做拓扑排序，同一层的插件按名字的字典序先后加载。
+
+<Callout type="error">
+  依赖成环的话，**所有插件都不会加载**，而不是只跳过环里的那几个。日志里会有 `plugin dependencies contain a cycle`。
+  
+  用 `loadBefore` 的时候很容易不小心绕出一个环，请注意。
+</Callout>
+
+## 校验失败时
+
+清单有问题只会影响它自己，其他插件正常加载。
+
+错误日志的格式是 `<插件目录>: <原因>`，下面列出一些常见的错误：
+
+<Accordions>
+  <Accordion title="missing clover.json">
+
+  目录里没有 `clover.json`。注意大小写，以及文件是不是真的叫这个名字。
+
+  </Accordion>
+  <Accordion title="invalid JSON: ...">
+
+  JSON 语法错误，冒号后面带着解析器的具体报错。`clover.json` 不允许注释和尾逗号。
+
+  </Accordion>
+  <Accordion title="name must be a non-empty string / type must be a non-empty string">
+
+  `name` 或 `type` 缺失、为空，或者不是字符串。
+
+  </Accordion>
+  <Accordion title="plugin name must match directory name">
+
+  `name` 和目录名不一致。更改其中一个来让它们相同。
+
+  </Accordion>
+  <Accordion title="entry must be a non-empty string">
+
+  `native` 类型必须有 `entry`。
+
+  </Accordion>
+  <Accordion title="js plugin must declare at least one of entry/preloadEntry/rendererEntry">
+
+  `js` 类型三个入口一个都没写，你总得写一个吧。
+
+  </Accordion>
+  <Accordion title="invalid version: ...">
+
+  `version` 不是 `major.minor.patch` 的格式。  
+  例如说你可能写了形如 `1.0`、`v1.0.0`、`1.0.0-beta` 的版本号，这些都不行。
+
+  </Accordion>
+  <Accordion title="passive must be a boolean / extraInfo must be an object">
+
+  `passive` 必须是 `true` 或 `false`，不能写成字符串。  
+  `extraInfo` 必须是对象，并且里面每个值都得是字符串。
+
+  </Accordion>
+  <Accordion title="duplicate plugin name: ...">
+
+  名字重复了，换一个名字。
+
+  `type` 为 `raw` 的 `CloverCore` 不受影响，那份清单由 CloverLoader 处理，CloverCore 扫描时会直接跳过。
+
+  </Accordion>
+</Accordions>

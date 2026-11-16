@@ -1,0 +1,271 @@
+---
+title: Kernel.h
+description: CloverLoader 的 C 式 API
+icon: Binary
+status: wip
+---
+
+<PrivateNotice />
+
+`Kernel.h` 是纯 C 接口，不依赖任何 C++ 运行时。
+
+写 C++ 的话建议直接用 [`Kernel.hpp`](/docs/loader/reference/kernel-cpp)。
+
+```c title="引入"
+#include <CloverNT/Runtime/Kernel.h>
+```
+
+## 基础类型
+
+四个 typedef，全部是定宽整数。
+
+<TypeTable
+  type={{
+    CloverHook: {
+      type: 'uint64_t',
+      description: 'Hook 句柄。0 表示无效，所有返回句柄的函数都用它表示失败',
+    },
+    CloverSubscription: {
+      type: 'uint64_t',
+      description: '订阅句柄。同样以 0 表示无效',
+    },
+    CloverAddress: {
+      type: 'uint64_t',
+      description: '进程虚拟地址。固定 64 位，不随平台变化',
+    },
+    CloverBool: {
+      type: 'int32_t',
+      description: '0 为假，非 0 为真',
+    },
+  }}
+/>
+
+## Hook
+
+<TypeTable
+  type={{
+    CloverHookInline: {
+      type: 'CloverHook CloverHookInline(CloverAddress address, void* detour, void** outOriginal)',
+      description: '在指定地址安装 inline hook，改写函数开头的指令',
+      parameters: [
+        { name: 'address', description: '被挂钩函数的虚拟地址' },
+        { name: 'detour', description: '替换函数的指针。调用约定必须与原函数一致' },
+        { name: 'outOriginal', description: '出参，收到一个可调用的跳板，用它回到原逻辑' },
+      ],
+      returns: '成功返回非 0 句柄，失败返回 0',
+    },
+    CloverHookImport: {
+      type: 'CloverHook CloverHookImport(const char* module, const char* symbol, void* detour, void** outOriginal)',
+      description: '改写某个模块导入表里的一项',
+      parameters: [
+        { name: 'module', description: '要改写其导入表的模块名' },
+        { name: 'symbol', description: '导入符号名' },
+        { name: 'detour', description: '替换函数的指针' },
+        { name: 'outOriginal', description: '出参，原始的导入地址' },
+      ],
+      returns: '成功返回非 0 句柄，失败返回 0',
+    },
+    CloverHookRemove: {
+      type: 'CloverBool CloverHookRemove(CloverHook hook)',
+      description: '卸载句柄对应的 hook。卸载后 outOriginal 拿到的跳板即失效，不要再调用',
+      parameters: [{ name: 'hook', description: '待卸载的句柄' }],
+      returns: '成功为非 0',
+    },
+  }}
+/>
+
+一个典型的用法是这样：
+
+```c
+static void* gOriginal = NULL;
+
+static int CloverNT_KERNEL_CALL myDetour(int value) {
+    // 先做自己的事，再调用原函数
+    return ((int (CloverNT_KERNEL_CALL*)(int)) gOriginal)(value);
+}
+
+void install(void) {
+    const CloverAddress target = CloverModuleBase("QQNT.dll") + 0x1234;
+    const CloverHook hook = CloverHookInline(target, myDetour, &gOriginal);
+    if (hook == 0) {
+        CloverLogWrite(CLOVER_LOG_ERROR, "demo", "hook failed");
+    }
+}
+```
+
+detour 的签名写错不会有任何编译期提示，运行起来就是栈被破坏。
+
+## 模块查询
+
+<TypeTable
+  type={{
+    CloverModuleBase: {
+      type: 'CloverAddress CloverModuleBase(const char* module)',
+      description: '取模块基址',
+      parameters: [{ name: 'module', description: '模块名，例如 QQNT.dll' }],
+      returns: '找不到时返回 0',
+    },
+    CloverModuleSize: {
+      type: 'size_t CloverModuleSize(const char* module)',
+      description: '取模块映像大小。配合基址可以圈出扫描范围',
+      parameters: [{ name: 'module', description: '模块名' }],
+      returns: '找不到时返回 0',
+    },
+  }}
+/>
+
+## 日志
+
+<TypeTable
+  type={{
+    CloverLogLevel: {
+      type: 'enum { CLOVER_LOG_TRACE = 0, CLOVER_LOG_DEBUG, CLOVER_LOG_INFO, CLOVER_LOG_WARN, CLOVER_LOG_ERROR, CLOVER_LOG_FATAL }',
+      description: '六个级别，从 0 递增。',
+    },
+    CloverLogWrite: {
+      type: 'void CloverLogWrite(CloverLogLevel level, const char* category, const char* message)',
+      description: '写一条日志',
+      parameters: [
+        { name: 'level', description: '日志级别' },
+        { name: 'category', description: '分类，一般是填插件名' },
+        { name: 'message', description: '日志正文，已经格式化好的字符串' },
+      ],
+    },
+    CloverConsoleEmit: {
+      type: 'void CloverConsoleEmit(const char* text)',
+      description: '直接往控制台写一行，不经过级别过滤，也不加时间戳和分类前缀。=',
+      parameters: [{ name: 'text', description: '原样输出的文本' }],
+    },
+  }}
+/>
+
+## DLL 加载事件
+
+<TypeTable
+  type={{
+    CloverDllLoadCallback: {
+      type: 'void (*)(const char* baseName, const char* fullPath, CloverAddress base, size_t size, void* user)',
+      description: '模块加载回调。它在加载该模块的那个线程上同步调用',
+    },
+    CloverDllLoadSubscribe: {
+      type: 'CloverSubscription CloverDllLoadSubscribe(CloverDllLoadCallback callback, void* user)',
+      description: '订阅模块加载通知。',
+      parameters: [
+        { name: 'callback', description: '回调函数' },
+        { name: 'user', description: '透传给回调的用户数据，不需要就传 NULL' },
+      ],
+      returns: '订阅句柄，0 表示失败',
+    },
+    CloverDllLoadUnsubscribe: {
+      type: 'void CloverDllLoadUnsubscribe(CloverSubscription subscription)',
+      description: '取消订阅',
+      parameters: [{ name: 'subscription', description: '订阅句柄' }],
+    },
+  }}
+/>
+
+## 事件总线
+
+<TypeTable
+  type={{
+    CloverEvent: {
+      type: 'struct { const char* name; const uint8_t* data; size_t length; uint8_t id[16]; CloverBool cancelled; const uint8_t* replacement; size_t replacementLength; }',
+      description: '事件载荷。name 是事件名，data 与 length 是原始数据，id 是运行时生成的 16 字节实例标识',
+    },
+    'CloverEvent.cancelled': {
+      type: 'CloverBool',
+      description: '订阅者把它置 1 表示取消这个事件。对网络包事件来说，取消就是不发出去',
+    },
+    'CloverEvent.replacement': {
+      type: 'const uint8_t* 配合 replacementLength',
+      description: '想改写数据时，把新数据的指针和长度填在这里。指针指向的内存由你持有，必须在回调返回之后依然有效',
+    },
+    CloverEventCallback: {
+      type: 'void (*)(CloverEvent* event, void* user)',
+      description: '事件回调。拿到的是可写指针，取消和替换都通过改写它完成',
+    },
+    CloverEventSubscribe: {
+      type: 'CloverSubscription CloverEventSubscribe(const char* name, CloverEventCallback callback, void* user)',
+      description: '按事件名订阅',
+      parameters: [
+        { name: 'name', description: '事件名' },
+        { name: 'callback', description: '回调函数' },
+        { name: 'user', description: '透传给回调的用户数据' },
+      ],
+      returns: '订阅句柄，0 表示失败',
+    },
+    CloverEventUnsubscribe: {
+      type: 'void CloverEventUnsubscribe(CloverSubscription subscription)',
+      description: '取消订阅',
+      parameters: [{ name: 'subscription', description: '订阅句柄' }],
+    },
+    CloverEventEmit: {
+      type: 'void CloverEventEmit(CloverEvent* event)',
+      description: '发布事件,同步调用',
+      parameters: [{ name: 'event', description: '事件载荷，发布方负责填 name、data 与 length' }],
+    },
+  }}
+/>
+
+取消与替换是互斥的，取消之后就不该再填 `replacement`，发布方也不会去看它。
+
+<Callout type="info">
+  如果你在写 CloverCore 插件，用 [C++ 事件总线](/docs/core/api/events)更合适。
+  它在这套 C 接口之上做了强类型封装，还能按插件自动清理监听器。
+</Callout>
+
+## 元信息
+
+<TypeTable
+  type={{
+    CloverPluginsDirectory: {
+      type: 'const char* CloverPluginsDirectory()',
+      description: '插件目录的绝对路径。返回的字符串由运行时持有，不要释放',
+      returns: '以 NUL 结尾的路径',
+    },
+    CloverQQVersion: {
+      type: 'const char* CloverQQVersion()',
+      description: '宿主 QQ 的版本号，形如 9.9.32-50969。',
+      returns: '以 NUL 结尾的版本串',
+    },
+    CloverSelfVersion: {
+      type: 'const char* CloverSelfVersion()',
+      description: 'CloverLoader 自身版本。版本号在构建期由 git tag 或 short SHA 推导，所以开发构建拿到的可能是一串哈希',
+      returns: '以 NUL 结尾的版本串',
+    },
+  }}
+/>
+
+## 调用约定与导出宏
+
+`Kernel.h` 里的每个函数都带 `CloverNT_KERNEL_API` 和 `CloverNT_KERNEL_CALL` 两个宏。
+
+`CloverNT_KERNEL_CALL` 是调用约定，Windows 上展开成 `__cdecl`，其他平台为空。
+
+你自己写的 detour 和回调也要带上它，否则栈的清理方有可能对不上。
+
+`CloverNT_KERNEL_API` 控制符号可见性，按宏的定义情况切换：
+
+<Tabs items={['Windows', 'Linux']}>
+  <Tab value="Windows">
+
+| 定义了什么 | 展开成 |
+| --- | --- |
+| `CloverNT_KERNEL_EXPORTS` | `__declspec(dllexport)` |
+| `CloverNT_KERNEL_STATIC` | 空 |
+| 都没定义 | `__declspec(dllimport)` |
+
+  </Tab>
+  <Tab value="Linux">
+
+| 定义了什么 | 展开成 |
+| --- | --- |
+| `CloverNT_KERNEL_EXPORTS` | `__attribute__((visibility("default")))` |
+| 都没定义 | 空 |
+
+  </Tab>
+</Tabs>
+
+这两个宏是给 CloverLoader 自己构建用的，作为使用方保持默认即可。
+
+SDK 的导入目标已经把平台宏配好，手动定义反而会让符号解析出问题。

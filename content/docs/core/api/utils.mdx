@@ -1,0 +1,86 @@
+---
+title: Utils
+description: 平台信息、路径工具与动态库
+icon: Settings
+status: wip
+---
+
+实用工具。
+
+```cpp title="引入"
+#include <CloverNT/API/Utils/System.hpp>
+#include <CloverNT/API/Utils/DynamicLibrary.hpp>
+```
+
+## System
+
+命名空间 `CloverNT::Utils::System`。
+
+<TypeTable
+  type={{
+    Platform: {
+      type: 'enum class { Windows, Linux }',
+    },
+    'GetCurrentPlatform()': { type: 'Platform' },
+    'GetCurrentPlatformName()': {
+      type: 'std::string_view',
+      description: '"windows" 或者 "linux"，和 clover.json 里 platform 字段的写法一致',
+    },
+    TimeWithMs: {
+      type: 'struct { uint16_t hour, minute, second, millisecond; }',
+      description: '时分秒加毫秒，日志的时间戳用的就是它',
+    },
+    'GetCurrentTimeWithMs()': { type: 'TimeWithMs', description: '当前本地时间' },
+    'GetModuleFilePath(module)': {
+      type: 'std::filesystem::path',
+      description: '模块文件的完整路径。传 nullptr 是主程序。取不到时返回空路径',
+    },
+    'GetModuleDirectory(module)': {
+      type: 'std::filesystem::path',
+      description: '模块所在的目录。取不到模块路径时退回当前工作目录',
+    },
+    'IsPathInside(child, parent)': {
+      type: 'bool',
+      description: 'child 是否在 parent 里面，两者相等也算。纯字面量比较，不解析符号链接或者 junction',
+    },
+  }}
+/>
+
+`ModuleHandle` 在 Windows 上是 `HMODULE`，在 Linux 上是 `void*`，定义在 `Macros.hpp` 里。
+
+<Callout type="warn">
+  `IsPathInside` 只是把两个路径转成绝对路径、规范化、再比较，**不会碰文件系统**。
+  
+  路径里如果有符号链接，它看到的是链接本身的位置，不是真正指向的位置。
+</Callout>
+
+## DynamicLibrary
+
+命名空间 `CloverNT::Utils`。动态库的 RAII 封装，析构时关闭。只能移动。
+
+<TypeTable
+  type={{
+    'load(path, searchDirectory)': {
+      type: 'Expected<void>',
+      description: '加载动态库。已经加载过返回 AlreadyLoaded。',
+    },
+    'close()': { type: 'Expected<void>' },
+    'handle()': { type: 'void*', description: '平台原生的句柄' },
+    'isLoaded()': { type: 'bool' },
+    'getSymbolAddress(name)': { type: 'Expected<void*>' },
+    'getSymbol<T>(name)': {
+      type: 'Expected<T>',
+      description: '取符号并转成 T。T 写得对不对不会被检查，错了就是调用时崩',
+    },
+  }}
+/>
+
+对于`load(path, searchDirectory)`，Windows 上 `searchDirectory` 会临时加进 DLL 搜索路径，让同目录的依赖库能被找到；
+
+Linux 的 `dlopen` 没有这个能力，`searchDirectory` 不起作用，依赖要靠 `RUNPATH`。
+
+<Callout type="warn">
+  **从库里取出的函数指针，在库被关闭之后立刻失效。**
+  
+  `DynamicLibrary` 析构就是关闭，警惕生命周期问题。
+</Callout>

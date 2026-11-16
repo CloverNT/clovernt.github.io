@@ -1,0 +1,188 @@
+---
+title: Nt.h
+description: 收发网络包
+icon: Send
+---
+
+<PrivateNotice />
+
+`Nt.h` 是 CloverLoader 暴露给 raw 插件的最底层网络包接口。
+
+CloverCore 的 [`CloverNT::Nt`](/docs/core/api/nt) 命名空间就是基于它实现的，Native 和 JavaScript 插件应优先使用那一套。
+
+```c title="引入"
+#include <CloverNT/Runtime/Nt.h>
+```
+
+<Callout type="error">
+  这个接口直接触达账号通信层。**插件不应该在用户不知情的情况下收发网络包或读取登录凭据**。  
+  确保使用它之前知道你在做什么。
+  
+  详细的使用边界见 [网络包指南](/docs/core/guides/packets)。
+</Callout>
+
+## 使用前提
+
+- 这些函数只在**登录态就绪**之后可用。之前调用会返回失败。
+- 推荐订阅 `packet::credential` 事件（`CloverEventSubscribe("packet::credential", ...)`）作为"就绪信号"，不要一直等 `ready`。
+- 所有函数都可在任意线程调用。接收类函数会**阻塞调用线程**直到结果到达或超时。
+
+## 回调
+
+```c
+typedef void (CloverNT_KERNEL_CALL* CloverPacketSink)(const uint8_t* data,
+                                                      size_t         length,
+                                                      void*          user);
+```
+
+sink 在接收函数即将返回时被调用一次，`data` 指向当次调用内有效的内存，返回后立即失效。
+
+如果需要跨调用保留，先 `memcpy` 。`user` 原样透传，用来绑定上下文。
+
+超时或失败时 sink **不会被调用**，接收函数返回 `0`。
+
+## 可用性
+
+<TypeTable
+  type={{
+    'CloverPacketReady()': {
+      type: 'CloverBool CloverPacketReady()',
+      description: '直接发包路径是否已经被 CloverLoader 扫描到。false 时 Send / Receive / Credential 都会返回失败',
+    },
+  }}
+/>
+
+## 发送
+
+<TypeTable
+  type={{
+    'CloverPacketSend': {
+      type: 'CloverBool CloverPacketSend(const char* command, size_t commandLength, const uint8_t* body, size_t bodyLength, uint32_t* outSequence)',
+      description: '发送一个网络包，不等响应',
+      parameters: [
+        { name: 'command', description: '命令名字节，比如 "trpc.msg.olpush.OlPushService.MsgPush"' },
+        { name: 'commandLength', description: '命令名字节数。显式传长度是因为协议允许命令名里出现任意字节，不靠 NUL 结尾' },
+        { name: 'body', description: '网络包体字节，通常是已经序列化好的 protobuf' },
+        { name: 'bodyLength', description: '包体字节数' },
+        { name: 'outSequence', description: '可空。非空时返回 CloverLoader 从底层拦截截到的序列号；截不到时写入 0（函数仍可能返回 1）' },
+      ],
+      returns: '0 失败 / 1 成功。失败意味着 ready == false 或拒绝了这次发送',
+    },
+  }}
+/>
+
+## 接收
+
+<TypeTable
+  type={{
+    'CloverPacketReceiveByCommand': {
+      type: 'CloverBool CloverPacketReceiveByCommand(const char* command, size_t commandLength, uint32_t timeoutMs, CloverPacketSink sink, void* user)',
+      description: '阻塞调用线程直到收到一个命令名匹配的网络包',
+      parameters: [
+        { name: 'command', description: '命令名' },
+        { name: 'commandLength', description: '命令名字节数' },
+        { name: 'timeoutMs', description: '毫秒。0 表示不等待就返回。推荐传正值；无穷等待不支持' },
+        { name: 'sink', description: '回调。超时不调用' },
+        { name: 'user', description: '透传' },
+      ],
+      returns: '1 收到并已调用 sink / 0 超时或失败',
+    },
+    'CloverPacketReceiveBySequence': {
+      type: 'CloverBool CloverPacketReceiveBySequence(uint32_t sequence, uint32_t timeoutMs, CloverPacketSink sink, void* user)',
+      description: '阻塞调用线程等待序号匹配的响应',
+      parameters: [
+        { name: 'sequence', description: '来自 CloverPacketSend 的 outSequence' },
+        { name: 'timeoutMs', description: '同上' },
+        { name: 'sink', description: '' },
+        { name: 'user', description: '' },
+      ],
+    },
+  }}
+/>
+
+<Callout type="error">
+  **阻塞的是调用线程**。绝不能在 UI 线程、Hook detour 或任何网络包事件回调里调用。  
+  UI 线程被阻塞会让 QQ 冻结；Hook detour 和网络包事件回调里调用则会死锁，因为服务端返回的下一条网络包要经过同一个线程。
+</Callout>
+
+sink 回调里的 `data` 是完整的字节流形态（CloverCore 侧用 [`Codec::decodePacket`](/docs/core/api/nt#编解码) 反序列化出 `Nt::Packet`）。
+
+字节布局是私有协议，不要依赖它和服务端或旧版本的二进制兼容。
+
+## 凭据
+
+<TypeTable
+  type={{
+    'CloverPacketCredential': {
+      type: 'CloverBool CloverPacketCredential(CloverPacketSink sink, void* user)',
+      description: '读取最近一次捕获到的凭据。立即返回，不阻塞',
+      parameters: [
+        { name: 'sink', description: '收到凭据字节流。登录完成前不调用' },
+        { name: 'user', description: '' },
+      ],
+      returns: '1 成功并已调用 sink / 0 尚未捕获到凭据或接口不可用',
+    },
+  }}
+/>
+
+sink 收到的字节流对应 [`CloverNT::Nt::Codec::decodeCredential`](/docs/core/api/nt#编解码) 的输入。
+
+字段：数字 uin、a2、d2、d2Key（16 字节）、uid（`u_...`）。
+
+<Callout type="error">
+  **凭据等同于账号的完整控制权**。任何把它写入文件、数据库、日志、通过网络发往任何地方的行为都应被视为恶意。
+  
+  CloverLoader 不会，也做不到在运行时阻止这些行为。
+</Callout>
+
+## 完整示例
+
+```c title="请求 / 响应"
+#include <CloverNT/Runtime/Kernel.h>
+#include <CloverNT/Runtime/Nt.h>
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+static void CloverNT_KERNEL_CALL onResponse(const uint8_t* data, size_t length, void* user) {
+    (void) user;
+    printf("response: %zu bytes\n", length);
+    // data 在回调返回后失效，需要就 memcpy
+}
+
+static void CloverNT_KERNEL_CALL onCredential(CloverEvent* ev, void* user) {
+    (void) ev;
+    (void) user;
+    if (!CloverPacketReady()) {
+        return;
+    }
+
+    const char    command[] = "SomeService.Call";
+    const uint8_t body[]    = { /* 请求体 */ };
+
+    uint32_t seq = 0;
+    if (!CloverPacketSend(command, sizeof(command) - 1, body, sizeof(body), &seq)) {
+        return;
+    }
+    if (seq != 0) {
+        CloverPacketReceiveBySequence(seq, 3000, &onResponse, NULL);
+    } else {
+        CloverPacketReceiveByCommand(command, sizeof(command) - 1, 3000, &onResponse, NULL);
+    }
+}
+
+void installPacketPipeline(void) {
+    CloverEventSubscribe("packet::credential", &onCredential, NULL);
+}
+```
+
+把阻塞的 `Receive*` 换到自己的工作线程，或者只在短超时场景使用，避免拖住主线程。
+
+## 参考
+
+<Cards>
+  <Card title="网络包指南" href="/docs/core/guides/packets" description="两种通道、修改、线程注意事项。" />
+  <Card title="Nt API（C++）" href="/docs/core/api/nt" description="这一套接口的 C++ 封装。" />
+  <Card title="Kernel.h" href="/docs/loader/reference/kernel-c" description="CloverLoader C 运行时的其他底层接口。" />
+</Cards>

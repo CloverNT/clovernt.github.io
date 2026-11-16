@@ -1,0 +1,256 @@
+---
+title: JavaScript 插件开发
+description: 运行在 QQNT 前端层的插件
+icon: Braces
+status: wip
+---
+
+JavaScript 插件跑在 QQ 的 Electron 里，适合改些界面、加点 UI 等需求。
+
+它没有 Hook 和内存操作等低级 API，如果有这些需求则请用 [Native 插件](/docs/core/plugins/native)。
+
+写 JS 插件不需要编译器，改完文件就能热重载，开发起来比 C++ 快得多。
+
+我们提供了 [JsPluginTemplate](https://github.com/CloverNT/JsPluginTemplate) 模板仓库，构建配置和 SDK 依赖都配好了，可以直接从它起步：
+
+- `src/` 里是标准的 ES module，`package.json` 写的是 `"type": "module"`。
+- 主进程入口打包成 CommonJS，产物叫 `main.cjs`；渲染进程入口打成 IIFE，叫 `renderer.js`。
+- 类型从 [clovernt-sdk](https://github.com/CloverNT/clovernt-sdk) 这个 git 仓库装，不用往自己仓库里拷类型文件。
+- `npm run build` 只打包，不做类型检查；类型检查请使用 `npm run typecheck` 。
+
+## 入口点
+
+`clover.json` 里的三个字段分别对应三个运行位置，至少要写一个：
+
+```json title="clover.json"
+{
+  "name": "MyJsPlugin",
+  "type": "js",
+  "entry": "main.cjs",
+  "preloadEntry": "preload.js",
+  "rendererEntry": "renderer.js"
+}
+```
+
+<TypeTable
+  type={{
+    entry: {
+      type: '主进程',
+      description: '用 Node 的 require 加载，是普通的 CommonJS 模块，按入口文件所在位置解析依赖，node_modules 可用，且能拿到完整的 ctx',
+    },
+    preloadEntry: {
+      type: 'preload',
+      description: '注册成 Electron 的 preload 脚本，每个会话都会注册。能用 ipcRenderer、contextBridge 这些 preload 环境里的东西',
+    },
+    rendererEntry: {
+      type: '渲染进程的页面',
+      description: '源码文本，由 CloverCore 自带的 preload 通过 IPC 取回，包进 (function(){ ... })() 里在页面主世界执行。不是模块，没有 require',
+    },
+  }}
+/>
+
+需要注意：
+
+- JS 插件需要等 Electron 的 `app` 就绪之后才开始加载，时序比 native 插件晚一点。
+- `rendererEntry` 的源码是每次页面请求时现读的磁盘文件。
+- 渲染进程里有一个全局对象 `clovernt` ，有且只有 `log`、`invoke`、`send`、`on` 四个成员，用来和主进程通信。
+- 加载或重载带有 `preloadEntry` / `rendererEntry` 的插件之后，CloverCore 会**重新加载所有窗口**，来让新入口生效。
+
+## 入口的导出
+
+推荐的写法是 ES module 的默认导出，用 SDK 的 `definePlugin` 包一层：
+
+```ts title="src/main.ts"
+import { definePlugin } from '@clovernt/sdk';
+
+export default definePlugin({
+    onLoad(ctx) {
+        ctx.logger.info(`${ctx.name} loaded`);
+    },
+    onUnload() {
+        // 可选，插件被卸载时调用
+    },
+});
+```
+
+`definePlugin` 运行时是个恒等函数，存在的意义是让 TypeScript 推断出 `ctx` 的类型，并且检查钩子名字有没有拼错。
+
+如果不想在运行时引用这个值的话，你可以用 `satisfies`：
+
+```ts title="src/main.ts"
+import type { CloverContext, PluginDefinition } from '@clovernt/sdk';
+
+export default {
+    onLoad(ctx: CloverContext) {
+        ctx.logger.info(`${ctx.name} loaded`);
+    },
+} satisfies PluginDefinition;
+```
+
+### CloverCore 识别的入口
+
+主进程入口是 `require` 进来的，CloverCore 按 CommonJS / ES module 的标准 interop 规则取出插件。
+
+按照如下的顺序探测：
+
+- 导出本身是函数，直接调用
+- 找 `onLoad`
+- 看 `default` 是不是函数或者带 `onLoad` 的对象。
+
+<TypeTable
+  type={{
+    'export default { onLoad }': {
+      type: '推荐',
+      description: '打包成 CommonJS 之后是 exports.default，CloverCore 会自动解包。require 到真正的 ES module 命名空间时同理',
+    },
+    'export function onLoad': {
+      type: '支持',
+      description: '命名导出。和 default 同时存在时，命名的 onLoad 优先',
+    },
+    'module.exports = { onLoad, onUnload }': {
+      type: '支持',
+      description: '手写 CommonJS 的对象式，和 export default 等价',
+    },
+    'module.exports = (ctx) => {}': {
+      type: '支持',
+      description: '函数式。返回值如果是函数，会被注册成清理回调',
+    },
+  }}
+/>
+
+`onUnload` 只有在 `onLoad` 存在并且执行成功之后才会被注册，只写 `onUnload` 不写 `onLoad` 的话它不会被调用。
+
+入口如果抛出异常则记作加载失败：已经注册的清理回调会先跑一遍，之后回滚模块缓存，插件标记成 `Failed`。
+
+<Callout type="info">
+  两个钩子都是**同步**调用的。`onLoad` 写成 `async` 的话，返回的 promise 会被丢掉，CloverCore 只会打一条 `returned a Promise` 的警告，里面抛出的错误也不算加载失败。  
+  如果要同步拿异步结果，应当用 [`clovernt.deasync`](/docs/core/js-api#deasync)。
+</Callout>
+
+<Callout type="warn">
+  导出里既没有函数也没有 `onLoad` 时，插件会被当成加载成功，但你的代码一行都没跑，日志里只有一行 `nothing was called`。最常见的原因是钩子名字拼错，或者导出的对象里压根没写 `onLoad`。
+</Callout>
+
+<Callout type="info">
+  插件目录里如果带了 `"type": "module"` 的 `package.json`，主进程入口要用 `.cjs` 扩展名，否则 Node 会把 `.js` 按 ESM 处理。  
+  模板的产物就叫 `main.cjs`，`clover.json` 的 `entry` 也会跟着写 `main.cjs`。
+
+  真正的 ESM 入口（`.mjs`，或者 `"type": "module"` 下的 `.js`）也能被 `require` 进来，但顶层 `await` 会直接报错，而且 Node 的 ESM 缓存清不掉，重载之后跑的还是旧代码。
+  
+  所以目前仍然建议打成 CommonJS，也许我们将来会解决这个问题。
+</Callout>
+
+## ctx 里有什么
+
+`ctx` 是 `CloverContext`，主要包含以下几类东西：
+
+- 身份信息：`name`、`version`、`loaderVersion`、`coreDir`、`plugins`
+- 日志：`logger`
+- Electron：`electron`、`app`、`ipcMain`、`onHeadersReceived`
+- 带自动清理的定时器：`setTimeout`、`setInterval`
+- 事件和网络包：`events`、`packet`
+- 卸载钩子：`onUnload`
+
+用 `ctx` 上的方法注册的东西，卸载时会自动清理。完整说明见 [CloverContext](/docs/core/js-api/context)。
+
+## 类型声明
+
+`@clovernt/sdk` **没有发布到 npm**，它发布在 [clovernt-sdk](https://github.com/CloverNT/clovernt-sdk) 这个 git 仓库里，内容由 CloverCore 的 CI 从 `framework/` 的构建产物生成。
+
+可使用 git 依赖安装：
+
+```json title="package.json"
+{
+  "devDependencies": {
+    "@clovernt/sdk": "git+https://github.com/CloverNT/clovernt-sdk.git#dev"
+  }
+}
+```
+
+<TypeTable
+  type={{
+    '#dev': {
+      type: '开发版',
+      description: 'CloverCore 的 main 每构建成功一次，dev 分支就多一个提交。package-lock.json 会把它 lock 在安装时的那个提交上，要更新可使用 npm update @clovernt/sdk',
+    },
+    '#semver:^1.0.0': {
+      type: '跟着 tag',
+      description: 'CloverCore 打 v* tag 时，同一份包会推到 clovernt-sdk 的 main 分支并打上同名 tag。',
+    },
+  }}
+/>
+
+<Callout type="warn">
+  **类型要和运行时部署的 CloverCore 对得上。** `node_modules/@clovernt/sdk/package.json` 里的 `cloverCore.version` 是这份类型对应的 CloverCore 版本，和插件运行时拿到的 `ctx.version` 是同一个字符串。
+  
+  如果对不上请更新 SDK，或者换一个对应版本的 CloverCore。
+</Callout>
+
+包里是全部类型声明和一个转发到全局 `clovernt` 的代理（`index.js`）：
+
+<Files>
+  <Folder name="node_modules/@clovernt/sdk" defaultOpen>
+    <File name="index.js" />
+    <File name="index.d.ts" />
+    <File name="sdk.d.ts" />
+    <File name="bridge.d.ts" />
+    <File name="log.d.ts" />
+    <File name="clovernt.gen.d.ts" />
+  </Folder>
+</Files>
+
+只用类型的话 `import type` 就够了，运行时的 `ctx` 会由 CloverCore 传进来：
+
+```ts title="src/main.ts"
+import type { CloverContext } from '@clovernt/sdk';
+```
+
+要用 `clovernt` 这个值也行，打包器会把那个代理一起打进插件。
+
+但这要求它留在 **`devDependencies`** 里：tsup 默认把 `dependencies` 当成外部依赖不打包，而插件目录下并没有 `node_modules`，运行时会找不到这个包。
+
+CloverCore 部署出来的 `framework/` 目录里也有同一份 SDK，运行时真正用到的只有 `clovernt-preload.js`：
+
+<Files>
+  <Folder name="plugins/CloverCore/framework" defaultOpen>
+    <File name="clovernt-preload.js" />
+    <Folder name="sdk">
+      <File name="index.js" />
+      <File name="index.d.ts" />
+      <File name="sdk.d.ts" />
+      <File name="bridge.d.ts" />
+      <File name="log.d.ts" />
+      <File name="clovernt.gen.d.ts" />
+    </Folder>
+  </Folder>
+</Files>
+
+## 一个完整的例子
+
+在主进程里注册一个 IPC 处理器，并让渲染进程调用它：
+
+```ts title="src/main.ts"
+import { definePlugin } from '@clovernt/sdk';
+
+export default definePlugin({
+    onLoad(ctx) {
+        ctx.ipcMain.handle('demo:ping', () => 'pong');
+        ctx.setInterval(() => ctx.logger.info('still alive'), 60_000);
+    },
+});
+```
+
+```js title="renderer.js"
+clovernt.invoke('demo:ping').then((reply) => {
+  clovernt.log('demo').info(`reply: ${reply}`);
+});
+```
+
+IPC 处理器和定时器都是通过 `ctx` 注册的，卸载时会自动取消掉，无需写清理代码。
+
+## 接下来
+
+<Cards>
+  <Card title="插件生命周期" href="/docs/core/plugins/lifecycle" />
+  <Card title="JavaScript SDK 参考" href="/docs/core/js-api" />
+</Cards>

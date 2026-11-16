@@ -1,0 +1,67 @@
+---
+title: CloverCore
+description: 面向 QQNT 的 Native / JavaScript 插件开发框架
+icon: Puzzle
+status: wip
+---
+
+import { Blocks, Braces, Compass, Library, Rocket } from 'lucide-react';
+
+CloverCore 是一个面向QQNT的插件加载框架，他提供了高层的高级API，并支持你使用C++和JavaScript两种语言编写插件。
+
+## 有什么优点
+
+### 随心所欲的调用Node.js / V8 API
+
+借助[libcxx-build](https://github.com/CloverNT/libcxx-build)的 libc++ 预构建和 [qqnt-sdk](https://github.com/CloverNT/qqnt-sdk) 的 node / v8 头文件，你可以自由的通过头文件调用这些API，并且自动处理链接，无需担心ABI兼容性问题。
+
+### 完善的 C++ ↔ JavaScript 的互作体系
+
+通过使用[Alka](https://github.com/SingerBallad/Alka)这一声明式 C++ ↔ V8 绑定库，C++与Javascript的调用和类型可直接方便的互通，并且自动生成 TypeScript 的类型声明。
+
+### 底层操作也要变得Modern！
+
+对[Mortis](https://github.com/SingerBallad/Mortis)的封装，让你在C++内也能用非常现代化的设施进行内存修改/Hook，全程类型安全。
+
+## 它的定位
+
+CloverCore是一个类型为`raw`的插件，直接被CloverLoader加载，之后CloverCore才会加载其他类型的插件。
+
+换句话说，CloverCore是一个夹在用户插件和最底层组件之间的胶水层，提供了一个更现代化的插件开发体验。
+
+<Callout type="info">
+  CloverCore 强制依赖 CloverLoader。  
+  CloverLoader 不公开发布，请自行寻找。
+</Callout>
+
+## 支持的插件类型
+
+<Cards>
+  <Card
+    icon={<Blocks />}
+    title="Native 插件"
+    href="/docs/core/plugins/native"
+    description="C++ 编写，上可调用Node.js/V8 API，下可裸操作内存/Hook/系统调用。"
+  />
+  <Card
+    icon={<Braces />}
+    title="JavaScript 插件"
+    href="/docs/core/plugins/javascript"
+    description="跑在 Electron 里，可以分别在主进程、preload 和渲染进程中工作。"
+  />
+</Cards>
+
+## 现在开始
+
+如果你准备好开始使用CloverCore（无论你是用户或开发者），请参阅下面的文档：
+
+<Cards>
+  <Card icon={<Rocket />} title="安装与部署" href="/docs/core/getting-started/installation" description="所有用户都需要了解的内容"/>
+  <Card icon={<Compass />} title="进阶指南" href="/docs/core/guides/events" description="深入了解 CloverCore 的高级用法"/>
+  <Card icon={<Library />} title="C++ API 参考" href="/docs/core/api" description="C++ 插件开发应参阅的API参考文档"/>
+  <Card icon={<Library />} title="JavaScript SDK" href="/docs/core/js-api" description="开始使用 JavaScript SDK 开发插件"/>
+</Cards>
+
+## 许可
+
+CloverCore 使用 LGPL-3.0，完整条款见仓库里的 `LICENSE`。

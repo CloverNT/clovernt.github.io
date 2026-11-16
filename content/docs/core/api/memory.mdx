@@ -1,0 +1,299 @@
+---
+title: Memory
+description: 模块、特征码、内存读写、补丁与 Hook
+icon: MemoryStick
+status: wip
+---
+
+用法讲解在[内存与特征码](/docs/core/guides/memory)和[挂钩函数](/docs/core/guides/hooking)。
+
+```cpp title="引入"
+#include <CloverNT/API/Memory/Memory.hpp>
+#include <CloverNT/API/Memory/Hook.hpp>
+```
+
+## 基础类型
+
+<TypeTable
+  type={{
+    Address: { type: 'std::uintptr_t' },
+    ResourceId: { type: 'std::uint64_t', description: 'Hook 和补丁在运行时里的标识，0 表示无效' },
+    ErrorCode: {
+      type: 'enum class : std::uint8_t',
+      description: 'Unknown、RuntimeInactive、PluginUnavailable、InvalidArgument、InvalidHandle、NoFreeSlots、ModuleNotFound、ImportNotFound、MemoryNotReadable、MemoryNotWritable、ProtectionFailed、HookInstallFailed、HookRemoveFailed',
+    },
+    'makeMemoryError(code, message)': {
+      type: 'Error',
+      description: '构造一个类别为 Memory 的 Error',
+    },
+  }}
+/>
+
+## MemoryProtection
+
+位标志枚举：
+
+<TypeTable
+  type={{
+    None: { type: '0' },
+    Read: { type: '1 << 0' },
+    Write: { type: '1 << 1' },
+    Execute: { type: '1 << 2' },
+    'ReadWrite / ReadExec / ReadWriteExec': { type: '组合值' },
+    'operator| / operator&': { type: 'constexpr MemoryProtection', description: '按位或、按位与' },
+    'hasFlag(value, flag)': { type: 'constexpr bool', description: '(value & flag) == flag' },
+  }}
+/>
+
+## Module
+
+<TypeTable
+  type={{
+    'name()': { type: 'std::string const&' },
+    'base()': { type: 'Address' },
+    'size()': { type: 'std::size_t' },
+    'contains(address)': { type: 'bool' },
+    'findExport(symbolName)': {
+      type: 'Expected<Address>',
+      description: '按导出名找地址',
+    },
+    'enumerateExports()': {
+      type: 'std::vector<std::pair<std::string, Address>>',
+      description: '全部导出：名字和地址',
+    },
+    'findSection(sectionName)': {
+      type: 'Expected<std::pair<Address, std::size_t>>',
+      description: '节区的起始地址和大小',
+    },
+  }}
+/>
+
+<TypeTable
+  type={{
+    'findModule(moduleName = {})': {
+      type: 'Expected<Module>',
+      description: '按子串匹配名字找已加载的模块，不传名字会返回主程序。找不到返回 ModuleNotFound',
+    },
+    'enumerateModules()': { type: 'std::vector<Module>' },
+  }}
+/>
+
+## 特征码
+
+<TypeTable
+  type={{
+    SignatureElement: {
+      type: 'struct { std::byte value; std::byte mask; }',
+      description: '一个字节的匹配规则，实际字节和掩码按位与之后等于 value 即为匹配。mask 为 0xFF 是确定字节，为 0 是通配，0xF0 和 0x0F 是只匹配一个半字节',
+    },
+    'SignatureElement::byte(v) / wildcard()': { type: 'static constexpr SignatureElement', description: '构造确定字节和通配' },
+    'SignatureElement::isWildcard() / isConcrete() / matches(b)': { type: 'constexpr bool' },
+    Signature: {
+      type: 'class',
+      description: '一串 SignatureElement。成员：empty()、size()、elements()、toString()',
+    },
+    SignatureView: {
+      type: 'std::span<SignatureElement const>',
+      description: '不持有所有权的视图',
+    },
+    'parseSignature(pattern)': {
+      type: 'Expected<Signature>',
+      description: '运行期解析文本。语法见 "内存指南"，每段是 ?、??、X?、?X 或者两位十六进制',
+    },
+    'compileSignature<Pattern>()': {
+      type: 'consteval std::array<SignatureElement, N>',
+      description: '编译期解析。写错会直接编译失败',
+    },
+    '"..."_sig': {
+      type: 'consteval std::array<SignatureElement, N>',
+      description: '字面量写法，在 Memory::literals 里',
+    },
+    '"..."_sigv': {
+      type: 'constexpr SignatureView',
+      description: '返回指向静态存储的视图',
+    },
+  }}
+/>
+
+### 扫描
+
+<TypeTable
+  type={{
+    ScanAlignment: {
+      type: 'enum class : std::uint8_t { X1 = 1, X16 = 16 }',
+      description: 'X1 按字节扫，X16 只扫 16 字节对齐的位置，更快',
+    },
+    ScanHint: {
+      type: 'enum class : std::uint64_t { None, X86_64, Pair0 }',
+      description: '位标志，支持 | 和 &。X86_64 启用 x86-64 代码的启发式，Pair0 从特征码开头按字节对扫',
+    },
+    ScanOptions: {
+      type: 'struct { ScanAlignment alignment; ScanHint hints; }',
+      description: '默认是 X1 加 None',
+    },
+    'findFirst(module, pattern, options = {})': {
+      type: 'ScanResult',
+      description: 'module 可以是模块名或者 Module；pattern 可以是字符串、Signature 或者 SignatureView，一共六个重载',
+    },
+    'findAll(module, pattern, options = {})': {
+      type: 'std::vector<ScanResult>',
+      description: '同上，返回全部命中',
+    },
+    'findFirstInSection(moduleName, sectionName, signature, options = {})': {
+      type: 'ScanResult',
+      description: '只在某个节区里扫。signature 是 Signature 或 SignatureView',
+    },
+    'findAllInSection(moduleName, sectionName, signature, options = {})': {
+      type: 'std::vector<ScanResult>',
+    },
+  }}
+/>
+
+<TypeTable
+  type={{
+    'ScanResult::hasResult() / operator bool': { type: 'bool' },
+    'ScanResult::get()': { type: 'Address', description: '命中的地址，没命中是 0' },
+    'ScanResult::read<Int>(offset = 0)': {
+      type: 'Expected<Int>',
+      description: '从命中地址偏移 offset 处读一个整数。没命中返回 InvalidHandle 错误',
+    },
+    'ScanResult::rel(offset, remaining = 0)': {
+      type: 'Expected<Address>',
+      description: '把 offset 处的 32 位相对偏移解成绝对地址：命中地址加 offset 加 4 加 remaining 再加偏移。remaining 是该偏移之后、指令结束之前还剩的字节数',
+    },
+  }}
+/>
+
+## 读写与保护
+
+<TypeTable
+  type={{
+    'read<T>(address)': { type: 'Expected<T>', description: 'T 必须可平凡拷贝' },
+    'write<T>(address, value)': { type: 'Expected<void>', description: 'T 必须可平凡拷贝' },
+    'readBytes(address, size)': { type: 'Expected<std::vector<std::uint8_t>>' },
+    'writeBytes(address, bytes)': { type: 'Expected<void>', description: 'bytes 是 std::span<std::uint8_t const>' },
+    'readMemory(dest, source, size)': { type: 'Expected<void>' },
+    'writeMemory(dest, source, size)': {
+      type: 'Expected<void>',
+      description: '目标页不可写时会临时放开保护，写完恢复',
+    },
+    'setProtection(address, size, protection)': {
+      type: 'Expected<MemoryProtection>',
+      description: '改保护，返回改之前的保护值',
+    },
+    'setProtectionRaw(address, size, protection)': {
+      type: 'Expected<void>',
+      description: '改保护，不查改之前的值',
+    },
+    'queryProtection(address)': { type: 'Expected<MemoryProtection>' },
+    'isReadable(address, size = 1)': { type: 'bool', description: '检查那一刻是否可读，当心检查与使用之间的竞态' },
+    'isWritable(address, size = 1)': { type: 'bool', description: '同上' },
+  }}
+/>
+
+## 补丁
+
+<TypeTable
+  type={{
+    ResourceOptions: {
+      type: 'struct { std::weak_ptr<Plugin::Plugin> owner; }',
+      description: '所有者。不传时取当前插件，只在 load() / unload() 期间有值',
+    },
+    'createPatch(address, bytes, options = {})': {
+      type: 'Expected<PatchHandle>',
+      description: '把 address 处改成 bytes。创建成功时补丁已经生效',
+    },
+    'createNopPatch(address, size, options = {})': {
+      type: 'Expected<PatchHandle>',
+      description: '改成 NOP。size 不能为 0，ARM64 上必须是 4 的倍数',
+    },
+    'PatchHandle::apply()': { type: 'Expected<void>', description: '重新打上补丁' },
+    'PatchHandle::restore()': { type: 'Expected<void>', description: '临时还原，补丁仍然登记着' },
+    'PatchHandle::remove()': { type: 'Expected<void>', description: '永久移除并还原，析构时调用' },
+    'PatchHandle::isApplied()': { type: 'bool' },
+    'PatchHandle::id() / operator bool': { type: 'ResourceId / explicit bool' },
+  }}
+/>
+
+`PatchHandle` 只能移动，不能复制。
+
+## Hook
+
+命名空间 `CloverNT::Memory::Hook`。
+
+<TypeTable
+  type={{
+    Options: {
+      type: 'struct { std::weak_ptr<Plugin::Plugin> owner; int priority; }',
+      description: 'owner 不传时取当前插件。priority 目前只是被保存，没有参与排序，import hook 也会忽略它',
+    },
+    Handle: {
+      type: 'class',
+      description: '资源句柄的基类。只能移动。析构时调用 remove()',
+    },
+    'Handle::enable() / disable()': { type: 'Expected<void>', description: 'disable 暂时移除掉，资源仍登记着，可以再 enable' },
+    'Handle::remove()': { type: 'Expected<void>', description: '永久卸载，会等正在执行的 detour 退出' },
+    'Handle::isEnabled()': { type: 'bool' },
+    'Handle::id() / operator bool': { type: 'ResourceId / explicit bool' },
+  }}
+/>
+
+<Callout type="error">
+  `priority` 不参与排序是一个BUG。
+</Callout>
+
+### 句柄类型
+
+<TypeTable
+  type={{
+    'InlineHandle<Sig>': {
+      type: 'class',
+      description: '强类型的 inline hook 句柄。比 Handle 多一个 original()，返回原函数的裸指针，没有安装成功时是 nullptr。成员 FnPtr 是目标函数的指针类型',
+    },
+    'ImportHandle<Sig>': {
+      type: 'class',
+      description: '强类型的 import hook 句柄。接口同 Handle',
+    },
+    'OriginalFunction<Sig>': {
+      type: 'class',
+      description: '在 detour 里回到原逻辑的入口，operator() 的参数和目标函数一致。原函数指针为空时不会崩溃，返回 R{} 或者什么都不做。get() 取裸指针',
+    },
+  }}
+/>
+
+### 创建 Hook
+
+`Sig` 是目标函数的签名，必须是自由函数签名（不是成员函数）。
+
+`Detour` 是可调用对象，签名是 `R(OriginalFunction<Sig>&, Args...)`，可以带捕获。
+
+每种签名最多同时有 64 个 Hook，装不下会返回 `NoFreeSlots`。
+
+<TypeTable
+  type={{
+    'Inline::create<Sig>(target, detour, options = {})': {
+      type: 'Expected<InlineHandle<Sig>>',
+      description: '在 target 地址装 inline hook，创建成功即生效。target 为 0 返回 InvalidArgument',
+    },
+    'Inline::create(fn, detour, options = {})': {
+      type: 'Expected<InlineHandle<...>>',
+      description: 'fn 是自由函数指针，签名从它的类型推导',
+    },
+    'Inline::create(target, detour, options = {})': {
+      type: 'Expected<InlineHandle<...>>',
+      description: '签名从 detour 推导。detour 必须有具体的签名，泛型 lambda 推不出来',
+    },
+    'Inline::createMember<MemFn>(detour, options = {})': {
+      type: 'Expected<InlineHandle<R(C*, Args...)>>',
+      description: 'MemFn 是非虚成员函数指针，地址从它取。成员函数按自由函数处理，多一个 this 参数。虚函数取不到地址，会失败',
+    },
+    'Inline::createMember<MemFn>(target, detour, options = {})': {
+      type: 'Expected<InlineHandle<R(C*, Args...)>>',
+      description: '自己提供地址，用于虚函数',
+    },
+    'Import::create<Sig>(moduleName, importModule, functionName, detour, options = {})': {
+      type: 'Expected<ImportHandle<Sig>>',
+      description: '改写 moduleName 的导入表里来自 importModule 的 functionName。importModule 和 functionName 不能为空。priority 对它无效',
+    },
+  }}
+/>

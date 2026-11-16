@@ -1,0 +1,351 @@
+---
+title: 基础设施
+description: 错误处理、日志器、异常与宏
+icon: Cpu
+status: wip
+---
+
+这里是 CloverCore 内部也在用的一些基础设施。
+
+```cpp title="引入"
+#include <CloverNT/API/Expected.hpp>
+#include <CloverNT/API/Logger.hpp>
+#include <CloverNT/API/Exception.hpp>
+#include <CloverNT/API/Macros.hpp>
+```
+
+## 错误处理
+
+框架统一返回 `Expected<T>`，而不是抛异常。成功时持有 `T`，失败时持有 `Error`。
+
+```cpp
+auto result = Plugin::PluginManager::loadPlugin("SomeJsPlugin");
+if (!result) {
+    logger().error("[{}] {}", result.error().code, result.error().message);
+    return;
+}
+```
+
+<TypeTable
+  type={{
+    'Expected<T>': { type: 'std::expected<T, Error>' },
+    Error: {
+      type: 'struct { ErrorCategory category; std::int32_t code; std::string message; std::optional<std::int64_t> nativeCode; }',
+      description: 'category 说明错误出在哪个模块，code 是该类别下的错误码，nativeCode 是系统返回的原始错误码（如果有）',
+    },
+    ErrorCategory: {
+      type: 'enum class : std::uint8_t',
+      description: 'General、Argument、Filesystem、System、DynamicLibrary、Module、Plugin、Event、Memory、Logger、Json',
+    },
+    CommonErrorCode: {
+      type: 'enum class : std::int32_t',
+      description: 'Unknown = 0、InvalidArgument、NotFound、AlreadyExists、InvalidState、OperationFailed、NotLoaded、AlreadyLoaded、Inactive、Unsupported、CallbackFailed、ParseFailed',
+    },
+  }}
+/>
+
+需要注意，`code` 不一定是 `CommonErrorCode`。
+
+`category` 是 `Memory` 的错误，`code` 是 [`Memory::ErrorCode`](/docs/core/api/memory) 的值。
+
+而系统调用失败时，`code` 往往就是系统错误码。
+
+所以建议先看 `category`，再解释 `code`。
+
+### 构造与转换
+
+<TypeTable
+  type={{
+    'makeError(category, message, code = Unknown, nativeCode = nullopt)': {
+      type: 'Error',
+      description: '还有一个重载，第二个参数换成 CommonErrorCode，消息放第三个',
+    },
+    'unexpected(error)': {
+      type: 'std::unexpected<Error>',
+      description: '在返回语句里把 Error 包成失败的 Expected',
+    },
+    'unexpected(category, message, code, nativeCode)': {
+      type: 'std::unexpected<Error>',
+      description: '直接构造并包装，同样有 CommonErrorCode 的重载',
+    },
+    'fromStdErrorCode(error, category = System, context = {})': {
+      type: 'Error',
+      description: '从 std::error_code 转换，context 会作为消息前缀',
+    },
+    'fromException(exception, category = General, code = OperationFailed)': {
+      type: 'Error',
+      description: '取异常的 what() 作消息',
+    },
+    'fromCurrentException(category = General, code = OperationFailed)': {
+      type: 'Error',
+      description: '在 catch(...) 里调用，把当前异常转成 Error。没有当前异常时消息是 "unknown exception"',
+    },
+    'errorMessage(error)': { type: 'std::string const&', description: '取 Error 的消息' },
+  }}
+/>
+
+```cpp title="惯用写法"
+Expected<Config> loadConfig(std::filesystem::path const& path) {
+    std::ifstream file(path);
+    if (!file) {
+        return unexpected(ErrorCategory::Filesystem, CommonErrorCode::NotFound,
+                          "config not found: " + path.string());
+    }
+    try {
+        return parse(file);
+    } catch (...) {
+        return unexpected(fromCurrentException(ErrorCategory::Json, CommonErrorCode::ParseFailed));
+    }
+}
+```
+
+## Logger
+
+怎么用见[日志](/docs/core/guides/logging)。
+
+<TypeTable
+  type={{
+    LogLevel: {
+      type: 'enum class { Debug = 0, Info, Warning, Error, Fatal }',
+      description: '五级，没有 trace。和 CloverLoader 的 CloverLogLevel 数值不对应，那边是六级',
+    },
+    'title() / setTitle(sv)': {
+      type: 'std::string / void',
+      description: '日志标题。插件自己的 logger() 已经设成了插件名',
+    },
+    'minLevel() / setMinLevel(level)': {
+      type: 'LogLevel / void',
+      description: '低于这个级别的日志被丢弃。默认 Info，Debug 构建下默认 Debug',
+    },
+    'shouldLog(level)': {
+      type: 'bool',
+      description: '获取当前日志级别能否被打印',
+    },
+    'setOutputConsole(bool)': { type: 'void', description: '是否输出到控制台，默认开' },
+    'setOutputColor(bool)': { type: 'void', description: '控制台是否带颜色，默认开' },
+    'setLogFile(filePath)': {
+      type: 'Expected<void>',
+      description: '追加写入文件，每条写完立即 flush。传空字符串撤掉文件输出。打不开返回 OperationFailed',
+    },
+    'log(level, fmt, args...) / log(level, message)': {
+      type: 'void',
+      description: '按级别输出。前者用 std::format 语法，后者直接给字符串',
+    },
+    'debug / info / warn / error / fatal': {
+      type: 'void',
+      description: '各级别的快捷写法，同样有格式化和纯字符串两种。debug 只在定义了 CloverNT_DEBUG 时才有效',
+    },
+    'logString(level, message)': {
+      type: 'void noexcept',
+      description: '直接输出字符串',
+    },
+    'flush() / Logger::flushAll()': {
+      type: 'void',
+      description: '刷新当前日志器 / 全部日志器的输出',
+    },
+  }}
+/>
+
+### 消费者
+
+日志器把每条日志交给若干个消费者。
+
+控制台和文件各是一个内建的消费者，当然你也可以自己加：
+
+<TypeTable
+  type={{
+    LogConsumer: {
+      type: 'class',
+      description: '自定义消费者的基类。实现 consume(message, plainLine, coloredLine)，需要的话再重写 flush()',
+    },
+    LogMessage: {
+      type: 'struct { LogLevel level; std::string title; std::string text; TimeWithMs time; }',
+      description: 'consume 收到的日志内容',
+    },
+    'addConsumer(consumer)': {
+      type: 'Expected<LogConsumerId>',
+      description: '挂一个消费者，用来把日志转到别处，比如自己的界面',
+    },
+    'removeConsumer(id) / clearConsumers() / consumers()': {
+      type: 'Expected<void> / void / std::vector',
+      description: '移除一个 / 移除全部 / 列出当前的消费者',
+    },
+  }}
+/>
+
+### LoggerRegistry
+
+<TypeTable
+  type={{
+    'LoggerRegistry::getInstance()': { type: 'static LoggerRegistry&' },
+    'getOrCreate(title)': {
+      type: 'std::shared_ptr<Logger>',
+      description: '按标题取日志器，没有就创建。同一个标题永远拿到同一个，注册表只持有弱引用',
+    },
+    'tryGet(title)': { type: 'std::shared_ptr<Logger>', description: '只获取不创建，没有会返回空指针' },
+    'erase(title)': { type: 'bool' },
+    'loggers()': { type: 'std::vector<std::shared_ptr<Logger>>' },
+  }}
+/>
+
+
+## Exception
+
+框架内部以 `Expected` 为主，异常只出现在少数场景，比如 `PluginBase::self()` 绑定之前被调用。
+
+<TypeTable
+  type={{
+    'Exception(message, category = General, code = OperationFailed)': {
+      type: 'explicit constructor',
+      description: '还有一个接收 Error 的重载。构造时会自动捕获调用栈',
+    },
+    'what()': { type: 'const char*' },
+    'error() / category() / code()': { type: 'const Error& / ErrorCategory / std::int32_t' },
+    'stackTrace()': { type: 'const StackTrace&', description: '构造时捕获的调用栈' },
+    'describe(maxFrames = 16)': { type: 'std::string', description: '消息加调用栈，适合直接打到日志里' },
+    'log(logger, level = Error, maxFrames = 16)': { type: 'void', description: '把 describe() 的结果写进给定的日志器' },
+  }}
+/>
+
+几个现成的子类，构造函数都只收一个 `std::string_view detail`：
+
+<TypeTable
+  type={{
+    OperationFailedException: { type: 'class final' },
+    InvalidArgumentException: { type: 'class final' },
+    NotFoundException: { type: 'class final' },
+    InvalidStateException: { type: 'class final' },
+    UnsupportedException: { type: 'class final' },
+  }}
+/>
+
+### StackTrace
+
+<TypeTable
+  type={{
+    'StackTrace::capture(skip = 0, maxFrames = 32)': { type: 'static StackTrace', description: '捕获当前调用栈，skip 是要跳过的最内层帧数' },
+    'StackTrace::fromAddresses(addresses, count)': { type: 'static StackTrace', description: '从一组地址构造' },
+    'frames()': {
+      type: 'std::vector<Frame>',
+      description: '解析后的帧。Frame 含 address、function（已 demangle，解析不到为空）、module（所属模块文件名）、file 和 line（没有行号信息时为空和 0）',
+    },
+    'toString(maxFrames = 16)': { type: 'std::string', description: '打日志时使用' },
+    'empty() / size() / addresses()': { type: '基本访问' },
+  }}
+/>
+
+### 硬件异常
+
+访问违例、除零这类硬件异常，正常情况下会直接让进程崩掉。
+
+我们提供了 `guardVeh` 和 `guardSeh`，可以把它们转成 C++ 异常：
+
+```cpp
+try {
+    const auto value = guardVeh([&] { return *reinterpret_cast<int*>(address); });
+} catch (const StructuredException& e) {
+    logger().error("fault: {} at {:#x}", faultKindName(e.kind()), e.faultAddress().value_or(0));
+}
+```
+
+<TypeTable
+  type={{
+    'guardVeh(fn)': {
+      type: 'template auto',
+      description: '执行 fn，期间出现的硬件异常被转成 StructuredException 抛出。fn 不接收参数，返回值原样返回。Windows 上基于向量化异常处理，Linux 上基于信号',
+    },
+    'guardSeh(fn)': {
+      type: 'template auto，仅 Windows',
+      description: '同样的用法，基于结构化异常处理',
+    },
+    FaultKind: {
+      type: 'enum class : std::uint8_t',
+      description: 'Unknown、AccessViolation、InPageError、IllegalInstruction、PrivilegedInstruction、IntegerDivideByZero、IntegerOverflow、FloatingPointError、StackOverflow、Breakpoint',
+    },
+    'faultKindName(kind)': { type: 'std::string_view', description: '枚举值的名字' },
+    FaultAccess: {
+      type: 'struct { Type type; std::uintptr_t address; }',
+      description: '访问违例时，哪种访问（Read、Write、Execute、Unknown）和哪个地址',
+    },
+    StructuredException: {
+      type: 'class final : Exception',
+      description: '成员：kind()、nativeCode()、faultingInstruction()、accessType()、faultAddress()，后两个是 optional',
+    },
+  }}
+/>
+
+<Callout type="warn">
+  这些异常捕获能处理的是无副作用的错误，但是无法处理之后状态已经被破坏的情况，例如栈溢出。
+</Callout>
+
+<Callout type="info">
+  有人会提到在 Windows 上的 `/Eha`，但是 CloverCore 没有使用它。
+  不使用的原因是 clang 对此的实现不完善，且这是一个非标准扩展。
+</Callout>
+
+调用你插件的 `load()` 和 `unload()` 时，外面包的就是 `guardVeh`。
+
+## Macros
+
+<TypeTable
+  type={{
+    CloverNT_EXPORT: {
+      type: '导出标注',
+      description: 'Windows 上是 __declspec(dllexport)，Linux 上是可见性属性。注册宏用它导出 clovernt_plugin_load',
+    },
+    CloverNT_IMPORT: { type: '导入标注', description: 'Windows 上是 __declspec(dllimport)，Linux 上为空' },
+    CloverNT_API: {
+      type: '公开符号标注',
+      description: '定义了 CloverNT_EXPORTS 展开成 CloverNT_EXPORT，定义了 CloverNT_API_STATIC 为空，否则是 CloverNT_IMPORT。保持默认即可',
+    },
+    ModuleHandle: {
+      type: 'HMODULE（Windows）/ void*（Linux）',
+    },
+    'LIBRARY_ENTRYPOINT(NAMESPACE, LOAD_FUNC, UNLOAD_FUNC)': {
+      type: '定义动态库入口',
+      description: '给没有入口函数的 raw 插件用',
+    },
+  }}
+/>
+
+### LIBRARY_ENTRYPOINT
+
+`raw` 插件没有 `clovernt_plugin_load` 这样的入口，CloverLoader 只是把它加载进来。
+
+这个宏帮你生成"被加载"和"被卸载"时该走的入口：
+
+<Tabs items={['Windows', 'Linux']}>
+  <Tab value="Windows">
+
+  生成 `DllMain`。
+
+  `DLL_PROCESS_ATTACH` 时先调用 `DisableThreadLibraryCalls`，再调用 `NAMESPACE::LOAD_FUNC(hModule)`。  
+  `DLL_PROCESS_DETACH` 时调用 `NAMESPACE::UNLOAD_FUNC(hModule)`。
+
+  </Tab>
+  <Tab value="Linux">
+
+  生成一个 `constructor` 函数：先清掉环境变量 `LD_PRELOAD`，再调用 `NAMESPACE::LOAD_FUNC(nullptr)`。
+
+  由于 Linux 在动态链接库上的各种奇异搞笑的生命周期，所以 `UNLOAD_FUNC` 实际不会被调用。
+
+  </Tab>
+</Tabs>
+
+```cpp
+namespace MyRaw {
+void Load(ModuleHandle) { /* ... */ }
+void Unload(ModuleHandle) { /* ... */ }
+}
+
+LIBRARY_ENTRYPOINT(MyRaw, Load, Unload);
+```
+
+<Callout type="warn">
+  Windows 上 `DLL_PROCESS_ATTACH` 是**在加载器锁里**执行的。
+  
+  别在 `LOAD_FUNC` 里做会再加载别的 DLL、或者要等别的线程的事，否则容易死锁。
+  
+  CloverCore 自己的做法是在入口里只做初始化，然后注册回调，等 Node 环境就绪再干活。
+</Callout>
+

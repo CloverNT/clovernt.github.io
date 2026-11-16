@@ -1,0 +1,175 @@
+---
+title: 安装与部署
+description: 部署CloverCore，然后让他跑起来
+icon: Download
+status: wip
+---
+
+部署 CloverCore 很简单，把他放在 CloverLoader 的插件目录里就行。
+
+当然这么讲还是太草率了，下面详细说明。
+
+## 前置条件
+
+<Callout type="warn">
+  CloverCore 依赖 CloverLoader，必须先装好 CloverLoader 。  
+  CloverLoader 不公开发布，请自行寻找。
+</Callout>
+
+CloverLoader 装好之后，你的目录里会有 `CloverLoader(.exe/.so)` 和 `CloverLoader.dll`。
+
+CloverLoader 的默认插件目录是与 `CloverLoader.dll` 同级的 `plugins/` 。
+
+如果你要更改这个行为，你可以设置 `CLOVERNT_PLUGINS_DIR` 这个环境变量。
+
+## 获取 CloverCore
+
+你可以在此处获取: 
+
+- 在 [Releases](https://github.com/CloverNT/CloverCore/releases) 获取一些可能并不稳定的稳定版
+- 在 [Actions](https://github.com/CloverNT/CloverCore/actions) 里最近一次成功构建的开发版
+
+从 Actions 下载需要登录 GitHub。
+
+<Callout type="info">
+  "稳定版" 与 "开发版" 主要的差异在发版时间间隔上，与是否稳定没有直接关联。  
+  不排除发生 "开发版比稳定版稳定" 这种 MIUI 行为的可能性。
+</Callout>
+
+通常来说，下载的产物的命名格式为 `CloverCore-<Platform>-<Arch>.zip` 。
+
+其中Platform的值可能是 `windows` 或者 `linux` ，Arch的值可能是 `x64` 或者 `arm64` 。
+
+请根据你的机器类型选择合适的发行包。
+
+
+## 部署
+
+<Steps>
+<Step>
+
+### 放进插件目录
+
+下载发行包后，通常情况下你会发现压缩包内有一个名为 `CloverCore` 的文件夹。
+
+把他放进上文提到过的插件文件夹即可。
+
+部署好之后，目录树应该是这个样子:
+
+<Files>
+  <Folder name="plugins" defaultOpen>
+    <Folder name="CloverCore" defaultOpen>
+      <Folder name="framework" />
+      <File name="clover.json" />
+      <File name="CloverCore.dll" />
+    </Folder>
+  </Folder>
+</Files>
+
+Linux 下的动态库叫 `CloverCore.so`（没有 `lib` 前缀），目录结构是一样的。
+
+`framework/` 要跟着一起放：JS 插件用的 preload 脚本就是 `framework/clovernt-preload.js`，CloverCore 按自己所在的目录去找它。只装 native 插件的话用不到它，但也没必要删。
+
+</Step>
+<Step>
+
+### 启动
+
+运行 CloverLoader，它会拉起 QQ，并把 CloverCore 加载进去。
+
+如果是第一次启动，建议给 `CloverLoader` 添加 `--console` 的参数或在配置文件内开启控制台日志。
+
+控制台的日志在很多时候都很有用，例如故障排除。
+
+</Step>
+<Step>
+
+### 确认加载成功
+
+如果一切正常，CloverLoader就会尝试加载CloverCore。
+
+如果出现了如下类似的日志：
+
+```text
+loaded raw plugin: <你的路径>/plugins/CloverCore/CloverCore.dll
+```
+
+那么 CloverCore 就成功的被加载了。
+
+之后的日志会出现 CloverCore 自己的汇总，大致是这样：
+
+```text
+[12:30:45.123 INF] [CloverCore] Loading plugins...
+[12:30:45.130 INF] [CloverCore] Loaded MyPlugin v0.1.0
+[12:30:45.131 INF] [CloverCore] Loaded 1 plugin(s).
+```
+
+插件是在 Node 环境就绪之后才开始加载的，不是 QQ 一启动就加载，所以这几行会比第一行晚出现一会儿。
+
+</Step>
+</Steps>
+
+## 装其他插件
+
+因为 CloverCore 自身就是一个插件，所以安装其他插件的步骤和上文是大同小异的。
+
+总的来说就是下载插件，放到插件文件夹，然后就安装好了。
+
+## 遇到问题
+
+<Accordions>
+  <Accordion title="没看到 loaded raw plugin 这一行">
+
+CloverLoader 只扫描 `plugins/` 下的一级子目录，并且只处理 `type` 为 `raw` 的 `clover.json`。
+
+需要你依次检查：
+
+- 目录层级有没有多套一层
+- `clover.json` 的 `type` 是不是 `raw`
+- 有没有写 `main`。缺了的话会有一条 `has no "main"; skipped` 的警告
+- `main` 指向的文件是不是真的在这个目录里
+
+</Accordion>
+  <Accordion title="提示 failed to load raw plugin">
+
+通常来说后面会带系统错误码，最常见的原因是平台或架构对不上。
+
+比如在 ARM64 的 QQ 里放了 x64 的 `CloverCore.dll`，那肯定是加载不了的。
+
+</Accordion>
+  <Accordion title="CloverCore 加载了，但自己的插件没加载">
+
+如果安装位置正确但是仍未加载的话，你可以打开控制台日志功能并看一下加载日志。
+
+CloverCore 遇到问题插件会报告错误并跳过此插件的加载。
+
+一般来说有以下几种常见情况：
+
+- `plugin name must match directory name`：目录名和 `name` 不一致
+- `invalid entry path`：`entry` 指向的文件不存在，或者写成了绝对路径、指到了插件目录之外
+- `skipped because platform is not compatible`：`platform` 和当前系统不符
+- `skipped because dependency ... is missing`：依赖的插件没装，或者版本不满足
+
+</Accordion>
+  <Accordion title="版本和 QQ 不匹配">
+
+截至目前，CloverCore 用的 node / v8 头文件锁定在 QQNT `9.9.32-50969`。
+
+因为 Electron 版本极少更新，故锚定在一个版本是合理并且节约资源的办法。
+
+如果真的遇到无法加载的情况，推荐你参考你当前使用 QQ 的发版时间，然后找一个时间近似的 CloverCore 版本重试。
+
+<Callout type="warn">
+  我们正在试验一套新的 Shim 系统，理论上能非常显著的提升框架的跨版本兼容性。  
+  这个系统很快就会完善并被文档化。
+</Callout>
+
+
+</Accordion>
+</Accordions>
+
+## 下一步
+
+<Cards>
+  <Card title="写第一个插件" href="/docs/core/getting-started/quick-start" description="十分钟做出一个能加载起来的 Native 插件。" />
+</Cards>

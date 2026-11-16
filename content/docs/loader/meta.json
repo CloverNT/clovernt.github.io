@@ -1,0 +1,7 @@
+{
+  "root": true,
+  "title": "CloverLoader SDK",
+  "description": "底层加载器的公开 C 接口",
+  "icon": "Cpu",
+  "pages": ["index", "integration", "reference"]
+}

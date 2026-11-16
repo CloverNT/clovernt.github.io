@@ -1,0 +1,180 @@
+---
+title: 工具链要求
+description: 编译器、标准库与构建系统
+icon: Wrench
+status: wip
+---
+
+为了省时间，我们先提供要求，具体原因后文会讲。
+
+## 结论
+
+<TypeTable
+  type={{
+    编译器: {
+      type: 'Clang（Windows 上用 clang-cl）',
+      description: 'CMake 阶段检测到非 Clang 编译器就会自行报告错误。',
+    },
+    'C++ 标准': {
+      type: 'C++23 或以上',
+      description: '公开 API 里用到了 std::expected、std::format 和 consteval 等新设施。',
+    },
+    标准库: {
+      type: '项目自带的 libc++，ABI 命名空间 __Cr',
+      description: '不能用 MSVC STL，也不能用系统自带的 libstdc++ / libc++。',
+    },
+    CMake: {
+      type: '4.0 以上',
+      description: 'CloverCore 的 CMake 要求最低版本即为 4.0。',
+    },
+  }}
+/>
+
+## 为什么必须用自带的 libc++
+
+CloverNT 的公开接口里到处是 `std::` 的类型：`Expected<T>` 是 `std::expected`，`PluginBase::directory()` 返回 `std::filesystem::path`。
+
+事件载荷里有 `nlohmann::json`，`Logger` 收的是 `std::format_string`。
+
+而且 CloverCore 还提供了 Node.js / V8 的接口，它们也大量使用标准库设施。
+
+这些类型会在你的插件、CloverCore 和 QQ 自己的模块之间来回传递。
+
+传递的两端必须对它们的内存布局和符号名达成一致，这就要求大家用同一份标准库。
+
+<Callout type="error">
+  混用标准库的后果一般有两种：
+  - 运气好是链接期会有一堆 `std::` 符号找不到。  
+  - 运气不好是链接通过，运行时在某次跨 ABI 传递 `std::string` 或 `std::vector` 时崩溃。
+</Callout>
+
+如果你细心观察过 `QQNT.dll` 的导出表，你会发现它引用的标准库符号格式为 `std::__Cr::`。
+
+这是 libcxx 的 "ABI Namespace", 详情请参阅[这里](https://releases.llvm.org/19.1.0/projects/libcxx/docs/BuildingLibcxx.html#cmdoption-arg-LIBCXX_ABI_NAMESPACE-STRING)。
+
+我们肯定没法改掉 QQNT.dll 的标准库，所以我们只能全部切换到 libcxx ，并用相同的 ABI Namespace 重新构建了一个自定义版本。
+
+插件侧只要在 CMake 里这样引入就行，模板的 `CMakeLists.txt` 已经包含了：
+
+```cmake
+set(LIBCXX_GITHUB_REPO "CloverNT/libcxx-build")
+set(LIBCXX_ABI_NAMESPACE "__Cr")
+include("${clovercore_SOURCE_DIR}/cmake/Libc++.cmake")
+target_use_libcxx(my-plugin)
+```
+
+脚本会按你的平台和架构，到 libcxx-build 的 Release 里挑名字形如 `windows-x64-__Cr.zip` 的包下载下来，解压到用户级缓存里，见下面的[依赖](#依赖)。
+
+## 目标平台
+
+<PlatformMatrix caption="四个平台都在 CI 中构建。" />
+
+写平台相关的代码时，用这两个宏：
+
+| 宏 | 含义 |
+| --- | --- |
+| `CloverNT_SYSTEM_WINDOWS` / `CloverNT_SYSTEM_LINUX` | 目标系统 |
+
+对于 Windows，Windows SDK 依然是必选项，故开发前要打开 Visual Studio Installer 先把 C/C++ 桌面开发套件装好。
+
+## 依赖
+
+依赖是在 CMake 配置阶段使用 FetchContent 拉取的，这里有一些值得注意：
+
+<TypeTable
+  type={{
+    'libcxx-build': {
+      type: 'CloverNT/libcxx-build',
+      description: '自定义 ABI 命名空间的 libc++ 预构建',
+      typeDescriptionLink: 'https://github.com/CloverNT/libcxx-build',
+    },
+    'qqnt-sdk': {
+      type: 'CloverNT/qqnt-sdk',
+      description: 'QQNT 的 node / v8 头文件。CloverCore 使用 QQNT 9.9.32-50969 的版本',
+      typeDescriptionLink: 'https://github.com/CloverNT/qqnt-sdk',
+    },
+    Mortis: {
+      type: 'SingerBallad/Mortis',
+      description: 'Inline / IAT Hook、内存补丁、特征码扫描等底层支持',
+      typeDescriptionLink: 'https://github.com/SingerBallad/Mortis',
+    },
+    Alka: {
+      type: 'SingerBallad/Alka',
+      description: '声明式的 C++ ↔ V8 绑定，同时生成 TypeScript 类型声明',
+      typeDescriptionLink: 'https://github.com/SingerBallad/Alka',
+    },
+  }}
+/>
+
+libc++ 和 QQNT SDK 不走 FetchContent：它们是按平台和架构下载的预构建包，缓存在用户目录里，同一台机器上所有项目、所有构建目录共用一份。
+
+| | libc++ | QQNT SDK |
+| --- | --- | --- |
+| Windows 默认缓存 | `%LOCALAPPDATA%\libcxx-build` | `%LOCALAPPDATA%\qqnt-sdk` |
+| Linux 默认缓存 | `$XDG_CACHE_HOME/libcxx-build` 或 `~/.cache/libcxx-build` | `$XDG_CACHE_HOME/qqnt-sdk` 或 `~/.cache/qqnt-sdk` |
+| 换个位置 | 环境变量 `LIBCXX_CACHE_DIR` | 环境变量或 CMake 变量 `QQNT_SDK_CACHE_DIR` |
+| 强制重新解析版本 | `-D LIBCXX_UPDATE=ON` | `-D QQNT_SDK_UPDATE=ON` |
+
+libc++ 把上次解析到的 Release tag 记在缓存目录里，命中缓存时连 GitHub API 都不会查。QQNT SDK 每次配置会查一次 Release 元数据（日志里是 `QQNTSdk: querying ...`），包已经缓存过就只打一行 `already cached`，不再下载；完全不想联网的话加 `-D QQNT_SDK_OFFLINE=ON`。
+
+## CMake 配置命令示例
+
+<Tabs items={['Windows (clang-cl)', 'Linux (clang)']}>
+  <Tab value="Windows (clang-cl)">
+
+```bash
+cmake -S . -B build -G Ninja -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang-cl -D CMAKE_CXX_COMPILER=clang-cl
+cmake --build build
+```
+
+  </Tab>
+  <Tab value="Linux (clang)">
+
+```bash
+cmake -S . -B build -G Ninja -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang-22 -D CMAKE_CXX_COMPILER=clang++-22
+cmake --build build
+```
+
+  </Tab>
+</Tabs>
+
+Debug 配置下 CloverCore 会定义 `CloverNT_DEBUG`，`Logger::debug` 才会生成代码，见[日志](/docs/core/guides/logging)。
+
+**插件的构建类型要和运行时的 CloverCore 一致**，发布版是 Release。
+
+clang-cl 下不指定的话 CMake 会默认成 Debug，原因和处理办法见[开发 Native 插件](/docs/core/plugins/native#指定构建类型)。
+
+## 常见的编译错误
+
+<Accordions>
+  <Accordion title="CloverNT 插件必须用 Clang 编译">
+
+  编译期错误，模板内代码拦截掉了。
+
+  检查 `CMAKE_CXX_COMPILER` 是不是指到了 `cl.exe` 或者 `g++`，Windows 上要写成 `clang-cl`。
+
+  </Accordion>
+  <Accordion title="链接时大量 std:: 符号未定义">
+
+  几乎总是标准库用错了。
+
+  确认 CMake 里调用了 `target_use_libcxx`，并且编译器确实是 Clang。
+
+  </Accordion>
+  <Accordion title="CMake 版本过低">
+
+  `FetchContent` 把 CloverCore 拉进来时，它顶层的 `cmake_minimum_required(VERSION 4.0)` 也会一起执行，所以实际要求是 CMake 4.0 以上。
+
+  报错会指向 CloverCore 的 `CMakeLists.txt`。
+
+  </Accordion>
+  <Accordion title="加载失败，依赖项里有 ucrtbased.dll、MSVCP140D.dll">
+
+  这是 Debug 版插件，链接了调试用的运行库，在没装 Visual Studio 的机器上通常找不到这些 DLL。
+
+  Debug 模式的插件和 Release 的 CloverCore 混用也有崩溃的风险，请改成 Release 重新构建。
+
+  clang-cl 下 CMake 默认就是 Debug，见[开发 Native 插件](/docs/core/plugins/native#指定构建类型)。
+
+  </Accordion>
+</Accordions>

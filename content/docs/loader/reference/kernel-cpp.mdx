@@ -1,0 +1,262 @@
+---
+title: Kernel.hpp
+description: CloverNT::Runtime::Kernel 命名空间
+icon: Braces
+status: wip
+---
+
+<PrivateNotice />
+
+`Kernel.hpp` 是 `Kernel.h` 之上的一层薄 C++ 封装，全部是头文件里的 inline 实现，不额外引入运行时依赖。
+
+```cpp title="引入"
+#include <CloverNT/Runtime/Kernel.hpp>
+
+using namespace CloverNT::Runtime::Kernel;
+```
+
+## 模块查询
+
+<TypeTable
+  type={{
+    moduleBase: {
+      type: 'std::uintptr_t moduleBase(const char* module) noexcept',
+      description: 'CloverModuleBase 的薄封装，找不到返回 0',
+    },
+    moduleSize: {
+      type: 'std::size_t moduleSize(const char* module) noexcept',
+      description: 'CloverModuleSize 的薄封装，找不到返回 0',
+    },
+  }}
+/>
+
+## InlineHook
+
+模板参数 `Sig` 是被挂钩函数的签名，形如 `int(int, const char*)`。
+
+这个类只移动不复制，析构时自动卸载。
+
+<TypeTable
+  type={{
+    'InlineHook<Sig>::install': {
+      type: 'static InlineHook install(std::uintptr_t target, Sig* detour) noexcept',
+      description: '在目标地址安装 hook',
+      parameters: [
+        { name: 'target', description: '被挂钩函数的地址' },
+        { name: 'detour', description: '替换函数，必须是普通函数指针' },
+      ],
+      returns: '失败时返回的对象 valid() 为 false，不会抛异常',
+    },
+    'InlineHook<Sig>::installImport': {
+      type: 'static InlineHook installImport(const char* module, const char* symbol, Sig* detour) noexcept',
+      description: '改写导入表，语义同 CloverHookImport',
+      returns: '失败时 valid() 为 false',
+    },
+    'InlineHook<Sig>::original': {
+      type: 'template <typename... Args> auto original(Args&&... args) const',
+      description: '调用被替换的原函数',
+    },
+    'InlineHook<Sig>::originalFn': {
+      type: 'Sig* originalFn() const noexcept',
+      description: '取原函数指针本身',
+    },
+    'InlineHook<Sig>::reset': {
+      type: 'void reset() noexcept',
+      description: '提前卸载，析构时也会调用，重复调用是安全的',
+    },
+    'InlineHook<Sig>::valid': {
+      type: 'bool valid() const noexcept',
+      description: '也可以直接写 if (hook)，它有 explicit operator bool',
+    },
+  }}
+/>
+
+```cpp title="示例"
+using Target = int(int);
+
+// detour 必须是普通函数，不能捕获状态
+InlineHook<Target> gHook;
+
+int myDetour(int value) {
+    if (value < 0) {
+        return 0;               // 直接短路，不调用原函数
+    }
+    return gHook.original(value);
+}
+
+void install() {
+    gHook = InlineHook<Target>::install(moduleBase("QQNT.dll") + 0x1234, myDetour);
+    if (!gHook) {
+        logError("demo", "install failed");
+    }
+}
+```
+
+<Callout type="warn">
+  `detour` 必须是普通函数指针，带捕获的 lambda 转不过去。  
+  需要捕获状态请用下面的 `Detour`。
+</Callout>
+
+## Detour
+
+`Detour` 接受任意可调用对象，包括带捕获的 lambda。
+
+代价是它需要一个静态的跳板入口。内部为每个签名类型维护一个 64 槽的跳板池，`install` 时分配一个，`reset` 时归还。
+
+detour 的调用签名和 `InlineHook` 不同，第一个参数是原函数的代理：
+
+```cpp
+// 对于 Sig = int(int)，detour 的签名是：
+//   int (Original<int(int)>& original, int value)
+```
+
+<TypeTable
+  type={{
+    'Detour<Sig>::install': {
+      type: 'template <typename D> static Detour install(std::uintptr_t target, D&& detour)',
+      description: '安装一个带状态的 hook',
+      parameters: [
+        { name: 'target', description: '被挂钩函数的地址，传 0 直接返回无效对象' },
+        { name: 'detour', description: '任意可调用对象，签名为 R(Original&, Args...)' },
+      ],
+      returns: '槽位耗尽或底层安装失败时返回的对象 valid() 为 false',
+    },
+    'Detour<Sig>::reset': {
+      type: 'void reset() noexcept',
+      description: '卸载并归还槽位。它会先等所有在途调用退出再归还，所以不能在 detour 自己里面调用',
+    },
+    'Detour<Sig>::valid': {
+      type: 'bool valid() const noexcept',
+      description: '同样有 explicit operator bool',
+    },
+    hookDetour: {
+      type: 'template <typename Sig, typename D> Detour<Sig> hookDetour(std::uintptr_t target, D&& detour)',
+      description: 'Detour::install 的自由函数写法',
+    },
+  }}
+/>
+
+```cpp title="示例"
+auto counter = std::make_shared<int>(0);
+
+auto hook = hookDetour<int(int)>(target, [counter](auto& original, int value) {
+    ++*counter;
+    return original(value);
+});
+```
+
+跳板池是按签名类型分的，`int(int)` 和 `void(void*)` 各有自己的 64 个槽位。
+
+同一个签名装到第 65 个才会失败，所以正常用不会碰到上限。
+
+<Callout type="info">
+  真能让一个函数挂 64 个以上的 hook，那我建议你还是别写代码了。
+</Callout>
+
+## Original
+
+`Detour` 的 detour 收到的第一个参数。
+
+<TypeTable
+  type={{
+    'Original<R(Args...)>::operator()': {
+      type: 'auto operator()(Args... args) const -> R',
+      description: '调用原函数',
+    },
+    'Original<R(Args...)>::get': {
+      type: 'Pointer get() const noexcept',
+      description: '取裸函数指针',
+    },
+  }}
+/>
+
+## 便捷构造函数
+
+<TypeTable
+  type={{
+    hookInline: {
+      type: 'template <typename Sig> InlineHook<Sig> hookInline(std::uintptr_t target, Sig* detour) noexcept',
+      description: '等价于 InlineHook<Sig>::install',
+    },
+    hookImport: {
+      type: 'template <typename Sig> InlineHook<Sig> hookImport(const char* module, const char* symbol, Sig* detour) noexcept',
+      description: '等价于 InlineHook<Sig>::installImport',
+    },
+  }}
+/>
+
+## 日志
+
+<TypeTable
+  type={{
+    log: {
+      type: 'void log(CloverLogLevel level, std::string_view category, std::string_view message) noexcept',
+      description: '写一条日志。参数是 string_view，内部会补上 NUL 结尾再转交给 C 接口',
+    },
+    'logTrace / logDebug / logInfo / logWarn / logError / logFatal': {
+      type: 'void logXxx(std::string_view cat, std::string_view msg) noexcept',
+      description: '六个级别各自的快捷写法',
+    },
+  }}
+/>
+
+这层不做格式化。要拼字符串请自己用 `std::format`，或者改用 CloverCore 的 [`Logger`](/docs/core/api/core)。
+
+## Subscription
+
+订阅句柄的 RAII 封装，析构时自动退订。
+
+它内部存了对应的退订函数指针，所以 DLL 加载订阅和事件订阅都能用同一个类型装。
+
+<TypeTable
+  type={{
+    'Subscription::reset': {
+      type: 'void reset() noexcept',
+      description: '提前退订',
+    },
+    'Subscription::valid': {
+      type: 'bool valid() const noexcept',
+      description: '句柄是否有效',
+    },
+    onDllLoad: {
+      type: 'Subscription onDllLoad(CloverDllLoadCallback cb, void* user = nullptr) noexcept',
+      description: '订阅模块加载通知',
+    },
+    onEvent: {
+      type: 'Subscription onEvent(const char* name, CloverEventCallback cb, void* user = nullptr) noexcept',
+      description: '按事件名订阅',
+    },
+  }}
+/>
+
+<Callout type="error">
+  返回值必须接住。
+
+  ```cpp
+  onEvent("CloverNT.PacketSend", myCallback);             // 临时对象立刻析构，订阅失效
+  auto sub = onEvent("CloverNT.PacketSend", myCallback);  // 正确
+  ```
+
+  这两个函数都标了 `nodiscard`，编译器会给警告。
+</Callout>
+
+## 元信息
+
+<TypeTable
+  type={{
+    pluginsDir: {
+      type: 'std::string_view pluginsDir() noexcept',
+      description: '插件目录。底层返回空指针时给出空 view，不会抛也不会是悬空指针',
+    },
+    qqVersion: {
+      type: 'std::string_view qqVersion() noexcept',
+      description: '宿主 QQ 版本号',
+    },
+    selfVersion: {
+      type: 'std::string_view selfVersion() noexcept',
+      description: 'CloverLoader 自身版本号',
+    },
+  }}
+/>
+
+三个函数返回的 view 都指向运行时持有的静态字符串，可以安全地跨函数传递，但不要假设它在模块卸载后还有效。

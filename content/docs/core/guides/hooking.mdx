@@ -1,0 +1,279 @@
+---
+title: 挂钩函数
+description: 用 Inline Hook 与 Import Hook 改写程序的行为
+icon: Zap
+status: wip
+---
+
+Hook 一直是兵家必争之地，所以了解它很重要。
+
+下文会介绍 CloverCore 主要支持的两种 Hook，并教你怎么使用。
+
+但是首先，你得先引入这个头文件：
+
+```cpp title="引入"
+#include <CloverNT/API/Memory/Hook.hpp>
+```
+
+## 两种 Hook
+
+<TypeTable
+  type={{
+    'Inline Hook': {
+      type: 'Hook::Inline::create',
+      description: '直接改写函数开头的指令，把调用转到你的 detour。哪里都能用，不管调用来自哪个模块',
+    },
+    'Import Hook': {
+      type: 'Hook::Import::create',
+      description: '改写某个模块导入表里的一项。只拦得到跨模块调用，模块内部的直接调用拦不住，但比 Inline Hook 稳定，并且不依赖函数的指令长什么样',
+    },
+  }}
+/>
+
+能用导出名或者导入表解决的，优先用 Import；要挂的函数没有导出，再用 Inline。
+
+## Inline Hook
+
+稍微了解点计算机原理就应该知道，程序会被编译成机器码。
+
+如果我们想改写原始函数的行为，那我们在函数头部的机器码做点修改，让他跳到我的函数不就能控制了吗？
+
+没错，Inline Hook 就是这么简单。
+
+<Steps>
+<Step>
+
+### 找到目标地址
+
+一般有两种方法：
+
+- 按模块的导出名找 
+- 用特征码扫描
+
+具体怎么找可参阅[内存与特征码](/docs/core/guides/memory)。
+
+</Step>
+<Step>
+
+### 声明签名
+
+模板参数 `Sig` 是目标函数的签名，比如 `int(int)`。
+
+<Callout type="warn">
+  我们假设读者已经对 C/C++ 语言有了解。如果对函数签名不了解，请读这段文字。  
+  想象你的目标函数长得像这样：
+  ```c
+  int foo(int a, float b) {
+    // do sth.
+  }
+  ```  
+
+  函数签名的写法是RetType(Args...)，由此你就能知道这个函数的签名是`int(int, float)`。
+</Callout>
+
+它必须和目标函数**完全一致**，包括参数类型、返回类型和调用约定。
+
+签名写错没有任何编译期提示，运行起来栈会被破坏，表现为难以定位的崩溃。
+
+</Step>
+<Step>
+
+### 创建 Hook
+
+```cpp
+using namespace CloverNT;
+using Target = int(int); // 目标函数的签名
+
+class MyPlugin : public Plugin::PluginBase {
+public:
+    bool load() {
+        const auto target = Memory::findFirst("QQNT.dll", "48 89 5C 24 ? 57 48 83 EC 20");
+        if (!target) {
+            logger().error("signature not found");
+            return false;
+        }
+
+        auto hook = Memory::Hook::Inline::create<Target>(
+                /* 目标地址 */ 
+                target.get(),
+                /* detour，一般为了方便写成lambda */
+                [](Memory::Hook::OriginalFunction<Target>& original, int value) {
+                    return original(value + 1);
+                });
+        if (!hook) {
+            logger().error("hook failed: {}", hook.error().message);
+            return false;
+        }
+
+        mHook = std::move(hook.value());
+        return true;
+    }
+
+private:
+    Memory::Hook::InlineHandle<Target> mHook;
+};
+```
+
+上面的特征码只是随便打的一些东西，实际工程内要换成你自己的东西。
+
+创建成功时 Hook 已经生效，不需要再手动启用。
+
+</Step>
+<Step>
+
+### 在 detour 里调用原函数
+
+detour 的第一个参数是 `OriginalFunction<Sig>&`，后面才是目标函数的参数。
+
+调用 `original(...)` 即为调用原函数的逻辑。
+
+你也可以不调用它，直接返回一个值，原函数就被完全短路了。
+
+<Callout type="warn">
+  `original` 背后的指针为空时，调用不会崩溃，而是**静默地返回默认值**（`R{}`）。  
+  如果你发现原逻辑莫名其妙没执行，先确认 Hook 是不是真的装上了。
+</Callout>
+
+</Step>
+</Steps>
+
+## 几种创建方式
+
+同样是 `Inline::create`，按你掌握的信息有不同几种写法：
+
+| 手头有 | 写法 |
+| --- | --- |
+| 地址，自己写签名 | `create<Sig>(address, detour)` |
+| 一个有类型的函数指针 | `create(&func, detour)`，签名从指针类型推导 |
+| 地址，detour 的签名具体 | `create(address, detour)`，签名从 detour 推导。泛型 lambda 推不出来，要显式写 `Sig` |
+| 非虚成员函数指针 | `createMember<&Class::method>(detour)`，detour 的第一个参数之后是 `Class*`，也就是 `this` |
+| 虚成员函数 | `createMember<&Class::method>(address, detour)`，要自己提供地址 |
+
+成员函数的 Hook 会被当成一个自由函数处理，并且签名里多了一个 `C*` 的 `this` 参数：
+
+```cpp
+Memory::Hook::Inline::createMember<&Player::attack>(
+        [](auto& original, Player* self, int damage) {
+            return original(self, damage);
+        });
+```
+
+## Import Hook
+
+```cpp
+auto hook = Memory::Hook::Import::create<int(int)>(
+        "QQNT.dll",        // 被改写导入表的模块
+        "other.dll",       // 函数是从哪个模块导入的
+        "SomeExport",      // 导入的函数名
+        [](auto& original, int value) {
+            return original(value);
+        });
+```
+
+一般来说很容易搞错三个参数的作用，他们从前到后依次是：
+
+- 更改哪个模块的 IAT（则为你想挂钩哪个模块内的调用）
+- 目标函数从哪个模块内被导出
+- 目标函数名
+
+Import Hook 没有签名推导，`Sig` 必须显式写。
+
+## Handle
+
+`create` 返回的 `InlineHandle` / `ImportHandle` 句柄只能移动，不能复制，**析构时会卸载 Hook**。
+
+所以必须把它存起来，别让它在函数结束时被销毁。
+
+<TypeTable
+  type={{
+    'enable()': { type: 'Expected<void>', description: '重新启用一个被 disable 过的 Hook' },
+    'disable()': { type: 'Expected<void>', description: '暂时撤掉 Hook，但资源还登记着，之后可以再 enable' },
+    'remove()': { type: 'Expected<void>', description: '永久卸载。析构时调用的就是它' },
+    'isEnabled()': { type: 'bool' },
+    'id()': { type: 'ResourceId', description: '资源标识，一般不使用' },
+    'original()': { type: 'FnPtr', description: '仅 InlineHandle 有。取原函数的裸指针，没有安装成功时是 nullptr' },
+  }}
+/>
+
+## Options
+
+Hook 的最后一个参数是 `Options`，都有默认值：
+
+<TypeTable
+  type={{
+    owner: {
+      type: 'std::weak_ptr<Plugin::Plugin>',
+      description: '所有者。不传递时取当前插件，只在 load() / unload() 期间有值。别的地方创建 Hook 必须显式传，见下',
+    },
+    priority: {
+      type: 'int',
+      default: '0',
+      description: '目前只是被保存下来，没有参与任何排序，不会改变行为',
+    },
+  }}
+/>
+
+所有者的规则和事件监听器一样：在自己开的线程或者事件回调里创建 Hook，不传 `owner` 会报 `No current plugin is available`。
+
+详见[开发 Native 插件](/docs/core/plugins/native)。
+
+卸载插件时，框架会先把它的 Hook **挂起**，等 `unload()` 跑完，再统一撤销，所以不需要你在 `unload()` 里一个个 `remove()`。
+
+## 限制
+
+- detour 可以是带捕获的 lambda。
+- 每种签名最多同时存在 **64 个** Hook，装不下时 `create` 返回 `NoFreeSlots`。这个上限是按签名分别算的，`int(int)` 和 `void(void*)` 各有自己的 64 个。
+- `remove()`、`Handle` 的析构和插件卸载，都会等正在执行的 detour 退出。所以不要在 detour 里调用它们，否则会死锁。不过 `disable()` 不会等。
+
+## 安全须知
+
+<Callout type="error">
+  Hook 出问题的症状通常是 QQ **直接崩溃，而且崩的位置有时离出错的地方很远**。  
+  所以安装之前必须确保：
+
+  - 签名和调用约定与目标函数完全一致
+  - detour 在被挂钩函数所在的线程上执行。目标如果在 UI 线程被调用，detour 里的耗时操作会直接卡住界面
+  - QQ 更新后地址会变，硬编码地址一定会失效，应用特征码或者导出名
+  - 每装一个 Hook，就想好它在什么时候、由谁撤掉
+</Callout>
+
+## 问题排查
+
+<Accordions>
+  <Accordion title="Hook 装上了，但 detour 没被调用">
+
+  推荐在 detour 第一行打一条日志，先确认它到底有没有被走到。
+  
+  没有的话，常见原因是：
+
+  - 地址不对，特征码命中了别的位置。可用 `findAll` 看命中了几处
+  - 目标函数根本没被执行到
+  - 用的是 Import Hook，但调用发生在模块内部，没走导入表
+
+</Accordion>
+  <Accordion title="调用原函数之后崩溃">
+
+  一般是签名或者调用约定写错了。核对参数个数、类型、是否漏了成员函数的 `this`。
+
+</Accordion>
+  <Accordion title="创建时返回 No current plugin is available">
+
+  在没有"当前插件"的地方创建了 Hook，比如自己开的线程或者事件回调里。  
+  请显式传 `Options.owner`。
+
+</Accordion>
+  <Accordion title="QQ 更新之后失效">
+
+  地址变了。  
+  如果用的是硬编码地址，换成特征码。  
+  如果用的就是特征码，说明目标函数的指令变了，要重新取一份。
+
+</Accordion>
+</Accordions>
+
+## 参考
+
+<Cards>
+  <Card title="Memory API 参考" href="/docs/core/api/memory" />
+  <Card title="内存与特征码" href="/docs/core/guides/memory" />
+</Cards>

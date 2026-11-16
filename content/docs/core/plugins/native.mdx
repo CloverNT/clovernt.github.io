@@ -1,0 +1,331 @@
+---
+title: Native 插件开发
+description: 用 C++ 继承 PluginBase 并通过注册宏接入 CloverCore
+icon: FileCode
+status: wip
+---
+
+[快速开始](/docs/core/getting-started/quick-start)页讲的很快，但是很显然大家都不想局限于此。
+
+本页主要详细讲一些 Native 插件开发的要点和注意事项。
+
+## 插件类
+
+最小的插件就是一个继承 `PluginBase`、实现了 `bool load()` 的类：
+
+```cpp title="main.cpp"
+#include <CloverNT/API/Plugin/PluginBase.hpp>
+#include <CloverNT/API/Plugin/RegisterHelper.hpp>
+
+class MyPlugin : public CloverNT::Plugin::PluginBase {
+public:
+    bool load() {
+        logger().info("hello from {}", name());
+        return true;
+    }
+};
+
+CloverNT_REGISTER_PLUGIN(MyPlugin)
+```
+
+<Callout type="info">
+  `PluginBase` 不可拷贝也不可移动。
+</Callout>
+
+`load` 和 `unload` **不是虚函数**，是注册宏在编译期用 concept 探测出来的。
+
+这会导致两个行为（当然都是预期的）：
+
+- 没写 `bool load()`，编译直接失败，`static_assert` 会告诉你。
+- `unload` 签名写错了（比如返回了 `void`），**不会有任何提示**，只是这个插件变成了"不可卸载"。
+
+<TypeTable
+  type={{
+    'bool load()': {
+      type: '必须定义',
+      required: true,
+      description: '返回 false 表示加载失败。抛异常或者触发硬件异常（比如AV）也都算失败，不会崩掉整个 QQ',
+    },
+    'bool unload()': {
+      type: '可选',
+      description: '定义了它，插件才可以被热卸载。运行时会在卸载时调用它，在里面释放 load() 里拿到的东西',
+    },
+  }}
+/>
+
+加载失败时，框架会把这个插件已经注册的 Hook 和事件监听器清掉，Free 掉动态库，把它标记成 `Failed`。
+
+此时日志里写 `load callback failed` 或 `load callback threw: ...`。
+
+## PluginBase 提供的上下文
+
+由于插件类继承了 `PluginBase`，所以以下这些 protected 成员都可被使用：
+
+<TypeTable
+  type={{
+    'logger()': {
+      type: 'Logger&',
+      description: '标题是插件名的日志器，同名的日志器全局共享一个',
+    },
+    'name()': {
+      type: 'std::string_view',
+      description: 'clover.json 里的 name',
+    },
+    'type()': {
+      type: 'std::string_view',
+      description: 'clover.json 里的 type',
+    },
+    'manifest()': {
+      type: 'Manifest const&',
+      description: '完整的清单。自定义配置可以放在 extraInfo 里取',
+    },
+    'directory()': {
+      type: 'std::filesystem::path const&',
+      description: '插件自己所在的目录',
+    },
+    'dataDir()': {
+      type: 'std::filesystem::path',
+      description: 'directory() / "data"。目录不会自动创建',
+    },
+    'configDir()': {
+      type: 'std::filesystem::path',
+      description: 'directory() / "config"。目录不会自动创建',
+    },
+    'self()': {
+      type: 'NativePlugin&',
+      description: '框架侧的插件对象。需要它的接口时再用，绑定之前调用会抛出 InvalidStateException',
+    },
+  }}
+/>
+
+<Callout type="warn">
+  **不要在构造函数里调 `logger()`、`name()` 等函数。** 
+
+  因为插件对象是在 `clovernt_plugin_load` 里先构造、再绑定上下文的，构造函数跑的时候还没绑定，所以调用会抛出 `InvalidStateException`。
+
+  请把需要初始化的东西放到 `load()` 里。
+</Callout>
+
+## 插件注册宏
+
+让插件作者自己导出函数并处理还是太脑残了，所以我们提供了宏 `CloverNT_REGISTER_PLUGIN(T)` 用来方便的完成这一切。
+
+`CloverNT_REGISTER_PLUGIN(T)` 展开后导出一个 `extern "C"` 函数：
+
+```cpp
+extern "C" bool clovernt_plugin_load(CloverNT::Plugin::NativePlugin& self);
+```
+
+CloverCore 加载动态库之后会寻找 `clovernt_plugin_load` 并加载此插件。
+
+这个函数内会按顺序做这些事：
+
+1. 用 `static_assert` 检查 `T` 有没有 `bool load()`。
+2. 取一个函数内 `static` 的 `T` 实例，第一次调用时构造。
+3. 如果 `T` 继承了 `PluginBase`，调用 `bindSelf` 绑定上下文。
+4. 调用 `load()`。抛异常的话先解绑，再把异常重新抛出去。
+5. `load()` 返回 `false` 的话，解绑并返回 `false`。
+6. 如果 `T` 定义了 `unload()`，注册卸载回调。
+
+所以你会发现，**不继承 `PluginBase` 也能做插件**，因为最小的插件只要求有 `bool load()`。
+
+当然代价是拿不到上面那些便捷成员。
+
+CloverCore 找不到这个符号时，日志是 `does not export clovernt_plugin_load`。
+
+## 资源归属与自动清理
+
+如果你仔细思考过此类框架的设计，你会发现如果插件卸载时如果自己不采取措施，那么 Hook，内存补丁等会无人管理，产生泄露，甚至是 AV 等灾难性故障。
+
+所以我们设计了资源记账制度，最大程度保障插件被卸载时所归属的资源被释放。
+
+Hook、内存补丁和事件监听器都会记在某个插件名下，叫作它的**所有者 (Owner)**。卸载插件（或者加载失败）时，框架会按所有者把这些资源全部清掉，不用你在 `unload()` 里逐个撤销。
+
+所有者默认取的是"当前插件"。
+
+当前插件**只在框架调用这个插件的 `load()` 和 `unload()` 期间有值**，故在这两个函数里创建资源时无需显式传入所有者。
+
+<Callout type="error">
+  **除此之外的地方都没有"当前插件"**：自己开的线程里没有，事件监听器的回调里也没有。
+
+  比如最常见的写法: 在 `DllLoadEvent` 的回调里等目标模块加载完再装 Hook。这时如果不显式传所有者，就会报告 `No current plugin is available`。
+
+  其中一个解决方法是在 `load()` 里用 `PluginManager::currentPlugin()` 取到插件，存成 `weak_ptr`，之后需要时作为 `owner` 传进去。
+
+  并且注意 `load()` 期间不能用 `getPlugin(name())` 取自己：插件要等 `load()` 成功返回，才会进入已加载列表。
+</Callout>
+
+框架管不到的东西还得你自己收拾：自己开的线程、打开的文件、申请的内存。这些应该放到 `unload()` 里。
+
+如果你认为 `unload()` 无法有效的清理你的资源，那你最好就不要声明 `unload()`，也就是声明此插件无法被热卸载。
+
+## 构建配置
+
+如果是新建项目，我们推荐使用[快速开始](/docs/core/getting-started/quick-start)内引用的模板，它把下面这些都已经配好了。
+
+要把 CloverNT 接进已有的 CMake 工程，需要做如下事项：
+<Steps>
+<Step>
+
+### 拉取 CloverCore
+
+```cmake title="CMakeLists.txt"
+include(FetchContent)
+set(CLOVERNT_GENERATE_DTS OFF CACHE BOOL "" FORCE) # trash
+FetchContent_Declare(CloverCore
+        GIT_REPOSITORY https://github.com/CloverNT/CloverCore.git
+        GIT_TAG main
+        GIT_SHALLOW TRUE
+        EXCLUDE_FROM_ALL)
+FetchContent_MakeAvailable(CloverCore)
+```
+
+`GIT_TAG main` 只适合自己折腾。插件编译时用的头文件，原则上和运行时部署的 CloverCore 需要是同一个版本，所以发布的插件请固定到具体的 tag。
+
+CloverCore 顶层声明了 `cmake_minimum_required(VERSION 4.0)`，所以你的工程实际也需要 CMake 4.0 以上。
+
+CloverCore 的依赖里还有 C 代码 (例如 Capstone)，所以工程要同时开启 C 和 C++，并且两个编译器都用 Clang：
+
+```cmake
+project(my-plugin LANGUAGES C CXX)
+```
+
+</Step>
+<Step>
+
+### 链接
+
+```cmake title="CMakeLists.txt"
+if (WIN32)
+    target_link_libraries(my-plugin PRIVATE CloverCore)
+else ()
+    target_link_options(my-plugin PRIVATE "LINKER:--exclude-libs,ALL")
+endif ()
+```
+
+因为 Windows 和 Linux 在链接上不一样：
+
+<Tabs items={['Windows', 'Linux']}>
+  <Tab value="Windows">
+
+链接 CloverCore 的导入库，符号在加载时由已经在进程里的 `CloverCore.dll` 提供。
+
+链接它意味着第一次构建时会把 `CloverCore.dll` 本身也编一遍，我们要的是它的导入库，所以首次构建比较慢。
+
+  </Tab>
+  <Tab value="Linux">
+
+无需显式链接。符号在 `dlopen` 时，从进程里已经加载的 `CloverCore.so` 里解析，CloverLoader 加载它的时候用了全局符号作用域。
+
+  </Tab>
+</Tabs>
+
+</Step>
+<Step>
+
+### 用同一套 libc++
+
+```cmake title="CMakeLists.txt"
+set(LIBCXX_GITHUB_REPO "CloverNT/libcxx-build")
+set(LIBCXX_ABI_NAMESPACE "__Cr")
+include("${clovercore_SOURCE_DIR}/cmake/Libc++.cmake")
+target_use_libcxx(my-plugin)
+```
+
+这个模块和 CloverCore 共用同一个用户级缓存（Windows 上是 `%LOCALAPPDATA%\libcxx-build`），所以不会再下载一遍。
+
+为什么必须这样、缓存位置怎么改等问题请参见[工具链要求](/docs/core/getting-started/toolchain)。
+
+</Step>
+<Step>
+
+### 生成清单，拼出产物目录
+
+模板不在仓库里直接放 `clover.json`，而是放一份 `clover.json.in`。
+
+项目名会从里面读，平台相关的字段由 CMake 填。
+
+构建完成在 `build/dist/<插件名>/` 可以得到一个可以直接复制走的插件目录。
+
+```json title="clover.json.in"
+{
+  "name": "MyPlugin",
+  "type": "native",
+  "version": "0.1.0",
+  "platform": "@PLUGIN_PLATFORM@",
+  "entry": "@PLUGIN_ENTRY@"
+}
+```
+
+```cmake title="CMakeLists.txt"
+set(CLOVER_MANIFEST_IN "${CMAKE_CURRENT_SOURCE_DIR}/clover.json.in")
+file(READ "${CLOVER_MANIFEST_IN}" CLOVER_MANIFEST)
+string(JSON PLUGIN_NAME GET "${CLOVER_MANIFEST}" name)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CLOVER_MANIFEST_IN}")
+
+project(${PLUGIN_NAME} LANGUAGES C CXX)
+
+# ... 定义目标、链接 CloverCore ...
+set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")
+
+set(PLUGIN_DIST "${CMAKE_BINARY_DIR}/dist/${PROJECT_NAME}")
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${PLUGIN_DIST}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${PROJECT_NAME}>" "${PLUGIN_DIST}/"
+        VERBATIM)
+
+if (WIN32)
+    set(PLUGIN_PLATFORM "windows")
+else ()
+    set(PLUGIN_PLATFORM "linux")
+endif ()
+set(PLUGIN_ENTRY "${PROJECT_NAME}${CMAKE_SHARED_LIBRARY_SUFFIX}")
+configure_file("${CLOVER_MANIFEST_IN}" "${PLUGIN_DIST}/clover.json" @ONLY)
+```
+
+一些注意事项：
+
+- 项目名、动态库名和清单里的 `name` 都来自同一处，改名字只改 `clover.json.in` 即可。
+- `@PLUGIN_ENTRY@` 由 `CMAKE_SHARED_LIBRARY_SUFFIX` 拼出来，Windows 得到 `MyPlugin.dll`，Linux 则得到 `MyPlugin.so`。
+- Linux 上必须给目标设 `PREFIX ""`，否则产物叫 `libMyPlugin.so`，和填进清单的 `entry` 对不上。CloverCore 自己也是这么处理的。
+- 模板里用的是 `CMAKE_BINARY_DIR`，因为插件一般是顶层工程。如果你的项目会被别人用 FetchContent 当子项目拉进去，请换成 `CMAKE_CURRENT_BINARY_DIR`。
+
+</Step>
+<Step>
+
+### 指定构建类型
+
+<Callout type="warn">
+  **最好让插件的构建类型和运行时的 CloverCore 一致，发布版是 Release。** 
+  
+  Debug 版插件会链接调试用的运行库（`ucrtbased.dll`、`MSVCP140D.dll` 这类带 D 的），和 Release 的 `CloverCore.dll` 混用有崩溃的风险，并且在没装 Visual Studio 的机器上这些 DLL 通常不存在，加载直接失败。
+
+  clang-cl 下，不指定的话 CMake 会把 `CMAKE_BUILD_TYPE` 默认成 `Debug`，你得到的就是 Debug 版。
+</Callout>
+
+有两种方法指定：
+
+- 配置时显式传 `-D CMAKE_BUILD_TYPE=Release`。
+
+- 在自己的工程里，在 `project()` **之前**设好默认值。
+
+```cmake title="CMakeLists.txt"
+get_property(IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if (NOT IS_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "构建类型" FORCE)
+endif ()
+
+project(my-plugin LANGUAGES C CXX)
+```
+
+</Step>
+</Steps>
+
+## 另请参阅
+
+<Cards>
+  <Card title="监听事件" href="/docs/core/guides/events" description="内建事件和自定义事件。" />
+  <Card title="挂钩函数" href="/docs/core/guides/hooking" description="Inline Hook 和 Import Hook。" />
+  <Card title="内存与特征码" href="/docs/core/guides/memory" description="找地址、读写内存、改页保护。" />
+  <Card title="C++ API 参考" href="/docs/core/api/plugin" />
+</Cards>

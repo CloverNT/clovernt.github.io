@@ -1,0 +1,164 @@
+---
+title: JavaScript SDK
+description: '@clovernt/sdk 的入口、全局对象与类型总览'
+icon: Braces
+status: wip
+---
+
+JavaScript 插件能用的 API，都挂在一个叫 `clovernt` 的全局对象上。
+
+`@clovernt/sdk` 是它的类型。
+
+怎么写 JS 插件见[开发 JavaScript 插件](/docs/core/plugins/javascript)。
+
+```ts title="引入"
+import { clovernt, definePlugin } from '@clovernt/sdk';
+import type { CloverContext, PluginDefinition } from '@clovernt/sdk';
+```
+
+`@clovernt/sdk` 没有发布到 npm，它由 CloverCore 的 CI 从 `framework/` 的产物生成，发布在 [clovernt-sdk](https://github.com/CloverNT/clovernt-sdk) 仓库。
+
+你应该用 git 依赖安装，装法详见开发页里的"类型声明"一节。
+
+## clovernt 全局
+
+SDK 导出的 `clovernt` 其实是一个 `Proxy`，每次访问属性都转发给 `globalThis.clovernt`。
+
+所以模块可以在运行时就绪之前被导入，访问属性时才会获取全局。
+
+<Callout type="warn">
+  在 CloverCore 之外的环境里（比如单元测试）`import` 不会立刻出错。  
+  **但是一访问属性就会抛出**：`@clovernt/sdk: the CloverNT runtime is not available (the clovernt global is missing)`。
+  
+  写测试的话要自己提供一个假的 `globalThis.clovernt`。
+</Callout>
+
+全局对象在不同位置的成员不一样：
+
+<TypeTable
+  type={{
+    主进程: {
+      type: '完整的 CloverApi',
+      description: '下面表格里的全部成员，只有 invoke、send、on 三个没有',
+    },
+    'preload / 渲染进程': {
+      type: '只有四个成员',
+      description: 'log、invoke、send、on。用来和主进程通信、输出日志，别的都没有',
+    },
+  }}
+/>
+
+这就是 `CloverApi` 的类型里一大半成员是可选的原因。
+
+## CloverApi
+
+<TypeTable
+  type={{
+    version: { type: 'string', description: 'CloverCore 的版本号' },
+    loaderVersion: { type: 'string | undefined', description: 'CloverLoader 的版本号' },
+    coreDir: { type: 'string | undefined', description: 'CloverCore 所在目录的绝对路径' },
+    plugins: {
+      type: 'PluginInfo[] | undefined',
+      description: 'JS 插件的列表，不含 native 插件。每项有 name，以及 main、preload、renderer 三个入口的绝对路径（没声明的是 undefined）。每次访问都是最新的',
+    },
+    'log(scope)': {
+      type: 'CloverLogger',
+      description: '取一个带作用域的日志器，scope 就是日志标题，通常填插件名',
+    },
+    events: { type: 'CloverEvents | undefined', description: '事件 API，见下方「事件 API」一章' },
+    packet: { type: 'PacketApi | undefined', description: '封包 API，见下方「封包 API」一章' },
+    deasync: {
+      type: 'Deasync | undefined',
+      description: '把异步变成同步，见下',
+    },
+    'invoke(channel, ...args)': { type: 'Promise<unknown> | undefined', description: '仅 preload 和渲染进程。对应 ipcRenderer.invoke' },
+    'send(channel, ...args)': { type: 'void | undefined', description: '仅 preload 和渲染进程。对应 ipcRenderer.send' },
+    'on(channel, callback)': { type: 'void | undefined', description: '仅 preload 和渲染进程。对应 ipcRenderer.on，callback 收到的参数不含 event' },
+    'loadPlugin(name)': { type: 'boolean | undefined', description: '运行时加载，只支持 js 类型。成功为 true' },
+    'unloadPlugin(name)': { type: 'boolean | undefined', description: '卸载' },
+    'reloadPlugin(name)': { type: 'boolean | undefined', description: '重载，只支持 js 类型' },
+    'rescan()': { type: 'number | undefined', description: '重新扫描插件目录，返回新发现并排队加载的自定义类型插件数量，失败返回 0' },
+    'registerLoader(config)': {
+      type: 'boolean | undefined',
+      description: '注册自定义加载器，用来支持新的插件 type。config 是 { id, load(name), unload(name), reload(name) }，三个方法都返回 { ok, error? }',
+    },
+    'unregisterLoader(id)': { type: 'boolean | undefined' },
+  }}
+/>
+
+这些管理插件的方法在 C++ 里对应 `PluginManager`，规则和限制见[插件生命周期](/docs/core/plugins/lifecycle)。
+
+它们返回布尔值，失败的原因不会带回来，你需要看日志。
+
+### deasync
+
+在主进程里，把异步结果同步地拿到。
+
+<TypeTable
+  type={{
+    'loopWhile(predicate)': {
+      type: 'void',
+      description: '只要 predicate() 返回真，就一直转动 Node 的事件循环。',
+    },
+    'await(promise)': {
+      type: 'T',
+      description: '同步等一个 Promise 完成，返回它的值；被拒绝的话抛出拒绝的原因',
+    },
+  }}
+/>
+
+等待期间事件循环仍在转，别的回调、定时器照常执行，所以它**可以重入**。
+
+能用 `async` / `await` 的地方，不要用它。
+
+## 日志
+
+<TypeTable
+  type={{
+    CloverLogger: {
+      type: 'interface',
+      description: 'debug、info、warn、error、fatal，每个收一个字符串',
+    },
+    LogLevel: {
+      type: '{ Debug: 0, Info: 1, Warning: 2, Error: 3, Fatal: 4 }',
+      description: '和 C++ 的 LogLevel 一一对应。注意和 CloverLoader C 接口的 CloverLogLevel 不一样。',
+    },
+  }}
+/>
+
+主进程里 `ctx.logger` 的实际类型比 `CloverLogger` 更丰富，还有 `setMinLevel`、`setLogFile` 等，和 C++ 的 `Logger` 对应。
+
+参见[日志](/docs/core/guides/logging)。
+
+## 插件入口
+
+<TypeTable
+  type={{
+    'definePlugin(plugin)': {
+      type: '恒等函数',
+      description: '原样返回传进去的东西，只为让 TypeScript 推断出 ctx 的类型、并检查钩子名字。配合 export default 用',
+    },
+    PluginHooks: {
+      type: '{ onLoad(ctx): void; onUnload?(): void }',
+      description: '对象形式。两个钩子都是同步调用的，返回的 promise 会被丢掉并打一条警告',
+    },
+    PluginSetup: {
+      type: '(ctx) => void | (() => void)',
+      description: '函数形式。返回的函数会被当作清理回调',
+    },
+    PluginDefinition: {
+      type: 'PluginHooks | PluginSetup',
+      description: 'definePlugin 接受的类型。旧名字 PluginEntry 保留为它的别名',
+    },
+  }}
+/>
+
+CloverCore 怎么从模块的导出里认出这几种形状，可参见[开发 JavaScript 插件](/docs/core/plugins/javascript#clovercore-识别的入口)。
+
+## 分章
+
+<Cards>
+  <Card title="CloverContext" href="/docs/core/js-api/context" description="插件入口收到的上下文。" />
+  <Card title="事件 API" href="/docs/core/js-api/events" description="监听与发布事件。" />
+  <Card title="封包 API" href="/docs/core/js-api/packet" description="收发 SSO 封包。" />
+</Cards>

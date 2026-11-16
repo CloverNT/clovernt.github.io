@@ -1,0 +1,222 @@
+---
+title: Events
+description: 事件基类、总线、监听器、优先级与全部内建事件
+icon: Radio
+status: wip
+---
+
+这页覆盖 `API/Events/` 下的八个头文件，命名空间是 `CloverNT::Event`。
+
+怎么用请参阅[事件系统](/docs/core/guides/events)。
+
+```cpp title="引入"
+#include <CloverNT/API/Events/EventBus.hpp>
+#include <CloverNT/API/Events/NamedEventApi.hpp>
+```
+
+## Event
+
+<TypeTable
+  type={{
+    Event: {
+      type: 'class Event',
+      description: '全部事件的基类，只有一个虚析构。自定义事件继承它',
+    },
+    NamedEventType: {
+      type: 'concept',
+      description: '要求类型有一个可转成 std::string_view 的静态成员 kEventName',
+    },
+    'getEventName<T>()': {
+      type: 'constexpr std::string_view',
+      description: '编译期获取事件名，读的是 T::kEventName',
+    },
+  }}
+/>
+
+## Cancellable
+
+<TypeTable
+  type={{
+    'isCancelled()': { type: 'bool' },
+    'setCancelled(bool = true)': {
+      type: 'void',
+      description: '设置取消标志。取消之后，事件总线不会再调用后面的监听器',
+    },
+  }}
+/>
+
+## EventPriority
+
+数值越大越先执行：
+
+<TypeTable
+  type={{
+    Monitor: { type: '5', description: '最先执行，约定上只观察不修改' },
+    Highest: { type: '4' },
+    High: { type: '3' },
+    Normal: { type: '2', description: '默认值' },
+    Low: { type: '1' },
+    Lowest: { type: '0', description: '最后执行' },
+  }}
+/>
+
+同一级内按监听器 id 升序，也就是先创建的先执行。
+
+## Listener
+
+<TypeTable
+  type={{
+    ListenerId: { type: 'std::uint64_t' },
+    ListenerPtr: { type: 'std::shared_ptr<ListenerBase>' },
+    'ListenerBase::id()': { type: 'ListenerId' },
+    'ListenerBase::priority()': { type: 'EventPriority' },
+    'ListenerBase::owner()': {
+      type: 'std::weak_ptr<Plugin::Plugin>',
+      description: '所有者。卸载这个插件时，它的监听器会被一并移除',
+    },
+    'Listener<T>::Callback': {
+      type: 'std::function<void(T&)>',
+      description: '强类型监听器的回调签名',
+    },
+    'Listener<T>(callback, priority, owner)': {
+      type: '构造函数',
+      description: 'priority 默认 Normal，owner 默认为空，注册时再回退到当前插件',
+    },
+  }}
+/>
+
+`ListenerBase` 不可拷贝，也不可移动，只能通过 `shared_ptr` 持有。
+
+## EventBus
+
+```cpp
+auto& bus = Event::EventBus::getInstance();
+```
+
+除了标了"成员"的，下面都是静态函数。
+
+<TypeTable
+  type={{
+    'registerEvent(name, owner = {})': {
+      type: 'static Expected<void>',
+      description: '声明一个事件并指定所有者。名字为空返回 InvalidArgument；owner 为空又没有当前插件返回 InvalidState；已经存在返回 AlreadyExists',
+    },
+    'registerEvent<T>(owner = currentPlugin())': {
+      type: 'static Expected<void>',
+      description: '强类型版本，事件名取自 T::kEventName',
+    },
+    'addListener(listener, name)': {
+      type: 'static Expected<void>',
+      description: '把一个已有的监听器挂到某个事件上。事件不存在会自动创建；同一个监听器重复添加返回 AlreadyExists',
+    },
+    'addListener<T>(listener)': {
+      type: '成员 Expected<void>',
+      description: '强类型版本，事件名取自 T',
+    },
+    'emplaceListener<T>(callback, priority, owner)': {
+      type: '成员 Expected<std::shared_ptr<Listener<T>>>',
+      description: '构造并添加监听器，最常用。priority 默认 Normal，owner 默认取当前插件，没有就会失败',
+    },
+    'removeListener(listener) / removeListener(id)': {
+      type: 'static Expected<void>',
+      description: '按监听器或者 id 移除',
+    },
+    'getListener(id)': { type: 'static ListenerPtr', description: '找不到返回空指针' },
+    'hasListener(id)': { type: 'static bool' },
+    'getListenerCount(eventName = {})': {
+      type: 'static std::size_t',
+      description: '某个事件上的监听器数量。不传名字会统计全部监听器的总数',
+    },
+    'events()': {
+      type: 'static std::vector<std::string>',
+      description: '已经登记的全部事件名，调试使用',
+    },
+    'publish(event, eventName)': {
+      type: 'static void',
+      description: '同步发布。返回时全部监听器都已经执行完，从事件对象上读结果',
+    },
+    'publish<T>(event)': {
+      type: '成员 void',
+      description: '强类型版本，事件名取自 T',
+    },
+    'clearPlugin(pluginName)': {
+      type: 'static Expected<void>',
+      description: '移除某个插件的全部监听器，以及它拥有的所有事件（事件上别人的监听器也一起移除）。卸载插件时框架会调用它',
+    },
+    'waitPluginIdle(pluginName)': {
+      type: 'static Expected<void>',
+      description: '等这个插件正在执行的监听器全部跑完。不能在该插件自己的监听器回调里调用，会返回 InvalidState',
+    },
+  }}
+/>
+
+## NamedEvent
+
+运行时按字符串匹配、载荷是 JSON 的事件，继承了 `Event` 和 `Cancellable`。
+
+它是 C++ 和 JavaScript 互通的桥。
+
+<TypeTable
+  type={{
+    'NamedEvent(name, payload)': {
+      type: 'NamedEvent(std::string, nlohmann::json)',
+      description: '只传名字的重载，载荷是 null',
+    },
+    'name()': { type: 'std::string const&' },
+    'payload()': {
+      type: 'nlohmann::json const& / nlohmann::json&',
+      description: '非 const 版本可以就地修改，后面的监听器都能看到',
+    },
+    'bridgeToken() / setBridgeToken(void*)': {
+      type: 'void*',
+      description: '内部使用',
+    },
+  }}
+/>
+
+<TypeTable
+  type={{
+    'emitNamed(name, payload)': {
+      type: 'bool',
+      description: '发布一个具名事件。返回值是事件有没有被取消，不是有没有人收到',
+    },
+    'emitNamed(name)': { type: 'bool', description: '无载荷版本，载荷是 null' },
+    'onNamed(name, callback, priority, owner)': {
+      type: 'Expected<ListenerPtr>',
+      description: '订阅具名事件。callback 签名是 void(NamedEvent&)，priority 默认 Normal，owner 默认为空并回退到当前插件。名字为空返回 InvalidArgument。事件由 CloverCore 持有',
+    },
+  }}
+/>
+
+## 内建事件
+
+全部是 `final` 类，事件名放在 `kEventName`。
+
+<TypeTable
+  type={{
+    DllLoadEvent: {
+      type: 'CloverNT.DllLoadEvent',
+      description: '不可取消。成员：baseName()、fullPath()、baseAddress()、imageSize()',
+    },
+    PacketSendEvent: {
+      type: 'CloverNT.PacketSend',
+      description: '可取消。packet() 返回 Nt::Packet&',
+    },
+    PacketRecvEvent: {
+      type: 'CloverNT.PacketRecv',
+      description: '可取消。packet() 返回 Nt::Packet&',
+    },
+    O3SendEvent: {
+      type: 'CloverNT.O3Send',
+      description: '可取消。packet() 返回 Nt::O3Packet&',
+    },
+    O3RecvEvent: {
+      type: 'CloverNT.O3Recv',
+      description: '可取消。packet() 返回 Nt::O3Packet&',
+    },
+    CredentialEvent: {
+      type: 'CloverNT.Credential',
+      description: '不可取消。credential() 返回 const Nt::Credential&',
+    },
+  }}
+/>

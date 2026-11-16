@@ -1,0 +1,55 @@
+---
+title: CloverNT 文档
+description: 面向 QQNT 的现代插件开发平台
+icon: BookOpen
+full: true
+status: wip
+---
+
+import { Cpu, Puzzle } from 'lucide-react';
+
+CloverNT 是一个面向 QQNT 的插件开发平台。
+
+QQNT 是腾讯 QQ 的跨端架构，桌面端的前端是 Electron。CloverNT 利用这一点，把自己的组件加载进 QQ 进程，让你可以用 C++ 或者 JavaScript 写插件，去改界面、挂钩函数、监听事件。
+
+## 从哪里开始
+
+<Cards>
+  <Card
+    icon={<Puzzle />}
+    title="CloverCore"
+    href="/docs/core"
+    description="Native / JavaScript 双端插件开发框架。要写插件，从这里开始。"
+  />
+  <Card
+    icon={<Cpu />}
+    title="CloverLoader SDK"
+    href="/docs/loader"
+    description="底层加载器对外暴露的 C 接口。需要直接对接运行时时看这里。"
+  />
+</Cards>
+
+## 平台由什么组成
+
+整条链路上有两个角色：
+
+- **CloverLoader** 启动 QQ，把运行时注入进去，并对外提供一组 C 接口。它不公开发布，文档里只覆盖它公开的 SDK 部分。
+- **CloverCore** 是开源的插件框架，由 CloverLoader 加载，再由它去加载 `plugins/` 下的插件。
+
+```text
+CloverLoader  ──启动 QQ、注入运行时──▶  CloverLoader.dll
+                                          │ 加载
+                                          ▼
+                                     CloverCore
+                                          │ 加载
+                                          ▼
+                                 你的 native / js 插件
+```
+
+大多数人只需要关心 CloverCore。CloverLoader 的 SDK 是给要绕开 CloverCore、直接对接运行时的人准备的。
+
+## 交流
+
+官方 QQ 群：`1097520805`。除此之外没有其他官方群，请认准这个号码，避免误入仿冒群。
+
+代码和问题反馈在 [GitHub 组织](https://github.com/CloverNT)。

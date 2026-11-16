@@ -1,0 +1,269 @@
+---
+title: 内存与特征码
+description: 找模块、扫特征码、读写内存与打补丁
+icon: MemoryStick
+status: wip
+---
+
+这部分是[挂钩函数](/docs/core/guides/hooking)的前置技能。
+
+如果你有计算机基础，那么这部分会很好阅读。
+
+在此之前：
+
+```cpp title="引入"
+#include <CloverNT/API/Memory/Memory.hpp>
+```
+
+## 找模块
+
+```cpp
+auto module = Memory::findModule("QQNT.dll");
+if (!module) {
+    logger().error("{}", module.error().message);
+    return false;
+}
+
+logger().info("base = {:#x}, size = {:#x}", module->base(), module->size());
+```
+
+<TypeTable
+  type={{
+    'findModule(name = {})': {
+      type: 'Expected<Module>',
+      description: '按名字找已加载的模块。名字是子串匹配，不传名字取的是主程序。找不到会返回 ModuleNotFound',
+    },
+    'enumerateModules()': {
+      type: 'std::vector<Module>',
+      description: '枚举进程里全部已加载的模块',
+    },
+  }}
+/>
+
+由于是子串匹配，所以模块名尽量不要写出歧义。
+
+`Module` 能做的事：
+
+<TypeTable
+  type={{
+    'name() / base() / size()': { type: '基本信息' },
+    'contains(address)': { type: 'bool', description: '地址是否落在这个模块里。排查野指针时很有用' },
+    'findExport(symbol)': { type: 'Expected<Address>', description: '按导出名找地址。这是最稳的定位方式，能用就优先用' },
+    'enumerateExports()': { type: 'std::vector<std::pair<std::string, Address>>', description: '列出全部导出函数' },
+    'findSection(name)': { type: 'Expected<std::pair<Address, std::size_t>>', description: '获取节区的起始地址和大小，可以用来缩小扫描范围' },
+  }}
+/>
+
+## 特征码扫描
+
+没有导出名可用的时候，就得扫特征码。
+
+特征码是一串字节，用空格分隔，用 `?` 表示通配：
+
+```text
+48 8B ? CC          ?  代表任意一个字节
+48 8B ?? CC         ?? 同上
+4? 8B ? CC          ?  可以只通配半个字节：4? 匹配 40–4F
+```
+
+每一段（token）只能是 1 个字符的 `?`，或者 2 个字符。
+
+写成别的长度、含有非十六进制字符、或者整个模式是空的，都会报错。
+
+### 扫描
+
+```cpp
+const auto hit = Memory::findFirst("QQNT.dll", "E8 ? ? ? ? 48 8B D8");
+if (!hit) {
+    return false;   // 没找到
+}
+
+const auto call = hit.get();                    // 命中的地址
+const auto target = hit.rel(1);                 // 把 E8 后面的 rel32 解成绝对地址
+```
+
+<TypeTable
+  type={{
+    'findFirst(module, pattern, options)': { type: 'ScanResult', description: '第一个命中。module 可以是模块名，也可以是 Module 对象' },
+    'findAll(module, pattern, options)': { type: 'std::vector<ScanResult>', description: '全部命中。用它来检查特征码是不是唯一' },
+    'findFirstInSection / findAllInSection': { type: 'ScanResult / std::vector<ScanResult>', description: '只在模块的某个节区里扫，比如 .text。比扫整个模块快，也更不容易误命中数据' },
+  }}
+/>
+
+`pattern` 可以是三种东西，对应三种成本：
+
+<Tabs items={['字符串', '运行期 Signature', '编译期 _sig']}>
+  <Tab value="字符串">
+
+每次调用都会解析一遍，写起来最方便，用于一次性的查找。
+
+```cpp
+Memory::findFirst("QQNT.dll", "48 8B ? CC");
+```
+
+  </Tab>
+  <Tab value="运行期 Signature">
+
+  先解析成 `Signature`，多次使用。解析失败会返回 `Expected` 的错误，适合特征码来自配置文件的场景。
+
+  ```cpp
+  auto sig = Memory::parseSignature(text);
+  if (!sig) { /* 格式错误 */ }
+  Memory::findFirst("QQNT.dll", *sig);
+  ```
+
+  </Tab>
+  <Tab value="编译期 _sig">
+
+  在编译期就展开成数组，写错了**直接编译失败**。
+
+  ```cpp
+  using namespace CloverNT::Memory::literals;
+
+  Memory::findFirst("QQNT.dll", "48 8B ? CC"_sigv);
+  ```
+
+  `_sigv` 返回指向静态存储的视图，`_sig` 返回一个 `std::array`。
+
+  用这两个还有个好处：可读的特征码文本不会留在二进制里。
+
+  </Tab>
+</Tabs>
+
+### ScanOptions
+
+<TypeTable
+  type={{
+    alignment: {
+      type: 'ScanAlignment',
+      default: 'X1',
+      description: 'X1 按字节扫描，X16 只在 16 字节对齐的位置上扫，快得多。目标地址不是 16 字节对齐的话，X16 会漏掉它',
+    },
+    hints: {
+      type: 'ScanHint',
+      default: 'None',
+      description: '传给底层扫描库的优化提示，可以用 | 组合。X86_64 启用 x86-64 代码的启发式，Pair0 从特征码开头按字节对来扫',
+    },
+  }}
+/>
+
+### ScanResult
+
+`ScanResult` 是一个轻量的包装，可用 `if (result)` 判断有没有命中。
+
+<TypeTable
+  type={{
+    'hasResult() / operator bool': { type: 'bool' },
+    'get()': { type: 'Address', description: '命中的地址，没命中时是 0' },
+    'read<Int>(offset = 0)': { type: 'Expected<Int>', description: '从命中地址往后 offset 字节处读一个整数。没命中时返回错误，不会去解引用空地址' },
+    'rel(offset, remaining = 0)': { type: 'Expected<Address>', description: '把 offset 处的 32 位相对偏移（比如 call、RIP 相对寻址的操作数）解成绝对地址。remaining 是该指令偏移之后还剩的字节数' },
+  }}
+/>
+
+### 怎么写可靠的特征码
+
+- 把会随编译变动的部分换成通配：立即数、相对偏移、栈偏移
+- 用 `findAll` 数一下命中几处。命中不止一处的特征码，早晚会挂到错的地方
+- 尽量限定在 `.text` 这样的节区里扫
+- 特征码不是越长越好，够唯一就行。太长了很难抗版本更新
+
+## 内存读写
+
+<TypeTable
+  type={{
+    'read<T>(address)': { type: 'Expected<T>', description: 'T 必须是可平凡拷贝的类型' },
+    'write<T>(address, value)': { type: 'Expected<void>', description: 'T 必须是可平凡拷贝的类型' },
+    'readBytes(address, size)': { type: 'Expected<std::vector<std::uint8_t>>', description: '读一段原始字节' },
+    'writeBytes(address, bytes)': { type: 'Expected<void>', description: '写一段原始字节' },
+    'readMemory(dest, source, size)': { type: 'Expected<void>', description: '底层形式，读进你自己提供的缓冲区。' },
+    'writeMemory(dest, source, size)': { type: 'Expected<void>', description: '底层形式，写' },
+  }}
+/>
+
+读写失败时返回错误，不会崩溃而是返回错误。常见的两个错误：`MemoryNotReadable` 和 `MemoryNotWritable`。
+
+写入的目标页不可写时，`writeMemory` 会**临时放开保护，写完再恢复**。所以改代码段不需要你手动改保护，直接写就行。
+
+## 补丁
+
+要改一段代码的字节，别自己 `writeMemory` 然后忘了改回来，你可以用补丁。
+
+补丁会记下原来的字节，卸载时自动还原。
+
+```cpp
+// 把 5 字节改成 NOP
+auto patch = Memory::createNopPatch(address, 5);
+if (!patch) {
+    logger().error("{}", patch.error().message);
+    return false;
+}
+mPatch = std::move(patch.value());   // 存起来，析构时会还原
+```
+
+<TypeTable
+  type={{
+    'createPatch(address, bytes, options)': { type: 'Expected<PatchHandle>', description: '把 address 处改成给定的字节' },
+    'createNopPatch(address, size, options)': { type: 'Expected<PatchHandle>', description: '改成 NOP。size 不能为 0，ARM64 上必须是 4 的倍数' },
+    'PatchHandle::apply()': { type: 'Expected<void>', description: '重新打上补丁。创建时已经是打上的状态' },
+    'PatchHandle::restore()': { type: 'Expected<void>', description: '临时还原，补丁依然登记着，之后可以再 apply' },
+    'PatchHandle::remove()': { type: 'Expected<void>', description: '永久移除并还原。析构时调用的就是它' },
+    'PatchHandle::isApplied()': { type: 'bool' },
+  }}
+/>
+
+补丁和 Hook 一样有所有者，卸载插件时会自动还原。
+
+## 页保护
+
+自己拿着裸指针去写内存之前，才需要手动改保护。
+
+`MemoryProtection` 是一组位标志：
+
+<TypeTable
+  type={{
+    None: { type: '0' },
+    Read: { type: '1' },
+    Write: { type: '2' },
+    Execute: { type: '4' },
+    'ReadWrite / ReadExec / ReadWriteExec': { type: '组合值', description: '对应的标志按位或' },
+  }}
+/>
+
+可以用 `|` 组合，用 `hasFlag(value, flag)` 判断。
+
+<TypeTable
+  type={{
+    'setProtection(address, size, protection)': { type: 'Expected<MemoryProtection>', description: '改保护，返回改之前的保护值，拿它来还原' },
+    'setProtectionRaw(address, size, protection)': { type: 'Expected<void>', description: '改保护，不去查改之前的值。不需要还原的时候用它，少一次查询' },
+    'queryProtection(address)': { type: 'Expected<MemoryProtection>', description: '查某个地址当前的保护' },
+    'isReadable(address, size = 1) / isWritable(address, size = 1)': { type: 'bool', description: '检查内存是否可读写' },
+  }}
+/>
+
+```cpp
+auto old = Memory::setProtection(address, size, Memory::MemoryProtection::ReadWriteExec);
+if (!old) return;
+
+// ... 改内存 ...
+
+(void) Memory::setProtectionRaw(address, size, *old);   // 还原
+```
+
+<Callout type="warn">
+  `isReadable` 和 `isWritable` 只能说明"检查的那一刻是可读的"。  
+  检查完、真正读之前，别的线程完全可能把这页释放掉。  
+  虽然它们能挡掉绝大多数野指针，但这不是安全保证，当心竞态。
+
+  改完保护记得改回去，让代码页长期保持可写既危险也容易被发现。
+</Callout>
+
+如果你怕读到坏地址就崩，可以把整段包进 `guardVeh`，把访问违例转成可捕获的异常。
+
+可参见[基础设施](/docs/core/api/core)。
+
+## 参考
+
+<Cards>
+  <Card title="Memory API 参考" href="/docs/core/api/memory" />
+  <Card title="挂钩函数" href="/docs/core/guides/hooking" />
+</Cards>

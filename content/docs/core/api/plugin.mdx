@@ -1,0 +1,301 @@
+---
+title: Plugin
+description: 插件基类、注册宏、清单结构与插件管理器
+icon: Blocks
+status: wip
+---
+
+写法和注意事项在[开发 Native 插件](/docs/core/plugins/native)里讲，这里只做参考。
+
+```cpp title="引入"
+#include <CloverNT/API/Plugin/PluginBase.hpp>
+#include <CloverNT/API/Plugin/RegisterHelper.hpp>
+#include <CloverNT/API/Plugin/PluginManager.hpp>
+```
+
+## PluginBase
+
+插件作者继承的基类，处在命名空间 `CloverNT::Plugin`。
+
+不可拷贝，也不可移动。
+
+<TypeTable
+  type={{
+    'bindSelf(NativePlugin&)': {
+      type: 'void',
+      description: '由注册宏在调用 load() 之前调用，插件作者不需要碰',
+    },
+    'clearSelf()': {
+      type: 'void',
+      description: '由注册宏在加载失败或者卸载之后调用',
+    },
+    'self()': {
+      type: 'NativePlugin&',
+      description: 'protected。绑定之前调用会抛 InvalidStateException',
+    },
+    'logger()': { type: 'Logger&', description: 'protected。标题是插件名，同名 Logger 会全局共享' },
+    'name() / type()': { type: 'std::string_view', description: 'protected。取自 clover.json' },
+    'manifest()': { type: 'Manifest const&', description: 'protected' },
+    'directory()': { type: 'std::filesystem::path const&', description: 'protected。插件自己所在的目录' },
+    'dataDir()': { type: 'std::filesystem::path', description: 'protected。directory() / "data"，注意目录不会自动创建' },
+    'configDir()': { type: 'std::filesystem::path', description: 'protected。directory() / "config"，注意目录不会自动创建' },
+  }}
+/>
+
+## 生命周期约定
+
+`load` 和 `unload` 不是虚函数，是注册宏用 concept 在编译期探测的：
+
+<TypeTable
+  type={{
+    'bool load()': {
+      type: '必须定义',
+      required: true,
+      description: '缺了会触发 static_assert：CloverNT_REGISTER_PLUGIN requires the plugin type to define bool load()',
+    },
+    'bool unload()': {
+      type: '可选',
+      description: '定义了才会注册卸载回调，插件才能被热卸载。签名对不上也不会报错，只是不会被识别',
+    },
+  }}
+/>
+
+## CloverNT_REGISTER_PLUGIN
+
+```cpp
+CloverNT_REGISTER_PLUGIN(MyPlugin)
+```
+
+展开后导出一个 `extern "C"` 函数，CloverCore 按这个名字找入口：
+
+<TypeTable
+  type={{
+    clovernt_plugin_load: {
+      type: 'extern "C" bool clovernt_plugin_load(CloverNT::Plugin::NativePlugin& self)',
+      description: '框架查找的导出符号。不用注册宏的话，需要自己导出一个同名且同签名的函数',
+      parameters: [{ name: 'self', description: '框架侧的插件对象' }],
+      returns: 'true 表示加载成功',
+    },
+  }}
+/>
+
+宏的具体行为见[开发 Native 插件](/docs/core/plugins/native)。
+
+## 插件对象
+
+这里的 `Plugin` 是框架侧的插件对象，和插件作者继承的 `PluginBase` 不是一回事。
+
+`PluginBase::self()` 拿到的就是对应的 `NativePlugin`。
+
+<TypeTable
+  type={{
+    PluginState: {
+      type: 'enum class { Unloaded, Loading, Loaded, Unloading, Failed }',
+      description: '插件状态，变化规则见"插件生命周期"',
+    },
+    'Plugin::manifest()': { type: 'Manifest const&' },
+    'Plugin::name() / type()': { type: 'std::string_view' },
+    'Plugin::state()': { type: 'PluginState' },
+    'Plugin::isUnloadable()': {
+      type: 'bool',
+      description: '能否被卸载。',
+    },
+    'Plugin::isBuiltin()': {
+      type: 'bool',
+      description: '是否内建插件。目前只有 CloverCore 自己',
+    },
+    PluginPtr: { type: 'std::shared_ptr<Plugin>' },
+  }}
+/>
+
+### NativePlugin
+
+<TypeTable
+  type={{
+    'NativePlugin::directory()': { type: 'std::filesystem::path const&' },
+    'NativePlugin::entryPath()': {
+      type: 'std::filesystem::path const&',
+      description: 'clover.json 里 entry 解析之后的绝对路径',
+    },
+    'NativePlugin::nativeHandle()': {
+      type: 'void*',
+      description: '动态库的系统句柄',
+    },
+    'NativePlugin::Callback': {
+      type: 'bool (*)(NativePlugin&)',
+      description: 'clovernt_plugin_load 的函数指针类型',
+    },
+    'NativePlugin::UnloadFn': { type: 'bool (*)()' },
+    'setUnloadHandler(plugin, fn)': {
+      type: 'void',
+      description: '注册卸载回调。插件定义了 unload() 时，注册宏会自动调用它，一般不用手写',
+    },
+  }}
+/>
+
+### JsPlugin
+
+<TypeTable
+  type={{
+    'JsPlugin::directory()': { type: 'std::filesystem::path const&' },
+    'JsPlugin::mainEntry()': {
+      type: 'std::optional<std::filesystem::path> const&',
+      description: '对应 clover.json 的 entry，已解析成绝对路径',
+    },
+    'JsPlugin::preloadEntry()': { type: 'std::optional<std::filesystem::path> const&' },
+    'JsPlugin::rendererEntry()': { type: 'std::optional<std::filesystem::path> const&' },
+  }}
+/>
+
+## Manifest
+
+`clover.json` 解析之后的结构。
+
+字段的取值规则和校验在 [clover.json 清单](/docs/core/plugins/manifest)里。
+
+<TypeTable
+  type={{
+    name: { type: 'std::string' },
+    version: { type: 'std::optional<Version>' },
+    type: { type: 'std::string' },
+    entry: { type: 'std::string' },
+    preloadEntry: { type: 'std::optional<std::string>' },
+    rendererEntry: { type: 'std::optional<std::string>' },
+    platform: { type: 'std::optional<std::string>' },
+    passive: { type: 'bool', default: 'false' },
+    author: { type: 'std::optional<std::string>' },
+    description: { type: 'std::optional<std::string>' },
+    extraInfo: { type: 'std::map<std::string, std::string>', description: '自定义键值对' },
+    'dependencies / optionalDependencies / conflicts / loadBefore': {
+      type: 'DependencyMap',
+      description: '插件名到可选版本要求的映射',
+    },
+  }}
+/>
+
+## Version
+
+<TypeTable
+  type={{
+    'Version::major / minor / patch': { type: 'int' },
+    'Version::parse(text)': {
+      type: 'static std::optional<Version>',
+      description: '只接受 major.minor.patch，三段非负整数，不接受后缀。空串和 "*" 返回空，解析失败也返回空',
+    },
+    'toString()': { type: 'std::string', description: '形如 1.2.3' },
+    'operator<=>': {
+      type: '默认的三路比较',
+      description: '按 major、minor、patch 依次比较，就是常规的版本大小。',
+    },
+  }}
+/>
+
+## PluginManager
+
+单例，几乎所有方法都是静态的，`getInstance()` 也能用。
+
+这里的 API 除了 getter，都返回 `Expected`。
+
+<TypeTable
+  type={{
+    'getPlugin(name)': {
+      type: 'static std::shared_ptr<Plugin>',
+      description: '按名字取已加载的插件，找不到返回空指针。',
+    },
+    'currentPlugin()': {
+      type: 'static std::shared_ptr<Plugin>',
+      description: '当前线程所属的插件。只在框架调用该插件的 load() / unload() 期间有值，别处都是空',
+    },
+    'plugins()': {
+      type: 'static std::vector<std::shared_ptr<Plugin>>',
+      description: '全部已加载的插件，包含内建的 CloverCore',
+    },
+    'scan()': {
+      type: 'static std::vector<PluginListing>',
+      description: '重新读一遍插件目录，列出每个有合法 clover.json 的插件，不会加载任何东西。',
+    },
+    'loadPlugin(name)': {
+      type: 'static Expected<void>',
+      description: '运行时加载。目前只支持 js 类型和有对应加载器的自定义类型，native 会返回 Unsupported',
+    },
+    'unloadPlugin(name)': {
+      type: 'static Expected<void>',
+      description: '卸载，规则见 "插件生命周期"',
+    },
+    'reloadPlugin(name)': {
+      type: 'static Expected<void>',
+      description: '重载。目前只支持 js 类型和有对应加载器的自定义类型',
+    },
+    'unloadAllPlugins()': {
+      type: 'static Expected<void>',
+      description: '按加载顺序的相反顺序卸载全部插件，退出时用的就是它',
+    },
+    'rescan()': {
+      type: 'static Expected<std::size_t>',
+      description: '重新扫描插件目录，发现新增的插件目录。已知的忽略，新发现的自定义类型插件会立即交给对应加载器加载，返回值就是这类插件的数量。新发现的 native 和 js 插件只会被登记，不会被自动加载',
+    },
+    'registerLoader(loader)': {
+      type: 'static Expected<void>',
+      description: '注册自定义加载器。id 不能为空，不能是 clover 或 cloverjs，不能含冒号，不能和已有的重复',
+    },
+    'unregisterLoader(id)': {
+      type: 'static Expected<void>',
+      description: '注销加载器。id 没有注册过则返回 NotFound',
+    },
+  }}
+/>
+
+`PluginListing` 的字段：
+
+<TypeTable
+  type={{
+    name: { type: 'std::string', description: '带类别前缀的名字' },
+    type: { type: 'std::string', description: '类别：native 对应 clover，js 对应 cloverjs，其他类型按原样' },
+    version: { type: 'std::optional<Version>' },
+    author: { type: 'std::string' },
+    description: { type: 'std::string' },
+    passive: { type: 'bool' },
+    loaded: { type: 'bool' },
+  }}
+/>
+
+## 自定义加载器
+
+`PluginLoader` 是个纯接口，实现它就能让 CloverCore 认识一种新的插件类型：
+
+<TypeTable
+  type={{
+    'PluginLoader::id()': {
+      type: 'virtual std::string_view（纯虚）',
+      description: '加载器的标识，必须和 clover.json 里的 type 完全一致，CloverCore 靠它分发',
+    },
+    'PluginLoader::load(name)': {
+      type: 'virtual Expected<void>（纯虚）',
+      description: '加载名为 name 的插件',
+    },
+    'PluginLoader::unload(name)': {
+      type: 'virtual Expected<void>（纯虚）',
+      description: '卸载。返回 Inactive 错误会被当成"没什么可卸的"而忽略',
+    },
+    'PluginLoader::reload(name)': {
+      type: 'virtual Expected<void>（纯虚）',
+      description: '重载。CloverCore 不会替你拆成 unload 加 load',
+    },
+  }}
+/>
+
+```cpp title="注册一个加载器"
+class MyLoader final : public Plugin::PluginLoader {
+public:
+    std::string_view id() const override { return "my-type"; }
+    Expected<void> load(std::string_view name) override { /* ... */ return {}; }
+    Expected<void> unload(std::string_view name) override { /* ... */ return {}; }
+    Expected<void> reload(std::string_view name) override { /* ... */ return {}; }
+};
+
+auto result = Plugin::PluginManager::registerLoader(std::make_shared<MyLoader>());
+```
+
+自定义类型的插件在所有 native 和 js 插件加载完之后才轮到加载器处理，所以注册加载器的插件要靠 `dependencies` 排在它们前面。
+
+JavaScript 插件也可以注册加载器，见 [JavaScript SDK](/docs/core/js-api)。

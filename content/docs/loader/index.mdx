@@ -1,0 +1,79 @@
+---
+title: CloverLoader SDK
+description: CloverLoader 对外暴露的 C 接口与预编译库
+icon: Cpu
+status: wip
+---
+
+<PrivateNotice />
+
+CloverLoader 是整个 CloverNT 的底座。
+
+它负责启动 QQ、把运行时注入进去，然后对外暴露一组 C 接口，让上层代码能挂钩函数、读写模块、收发网络包。
+
+你多半用不上这套 SDK。写插件应该用 [CloverCore 的 C++ API](/docs/core/api) 它更现代，更安全。
+
+只有两种情况需要直接对接 Kernel：
+
+- 你在写 `type` 为 `raw` 的插件。
+- 你想绕开 CloverCore 自己管理 Hook 的生命周期。
+- 你想写另一个框架，但是没有能力维护 QQNT 的底层设施。
+
+## 能力范围
+
+| 能力 | 接口 |
+| --- | --- |
+| Inline / IAT Hook | `CloverHookInline`、`CloverHookImport`、`CloverHookRemove` |
+| 模块查询 | `CloverModuleBase`、`CloverModuleSize` |
+| 日志与控制台 | `CloverLogWrite`、`CloverConsoleEmit` |
+| 模块加载通知 | `CloverDllLoadSubscribe` |
+| 事件总线 | `CloverEventSubscribe`、`CloverEventEmit` |
+| 运行时元信息 | `CloverPluginsDirectory`、`CloverQQVersion`、`CloverSelfVersion` |
+| 网络包 | `CloverPacketSend`、`CloverPacketReceiveBySequence` 等 |
+
+<Cards>
+  <Card title="Kernel.h" href="/docs/loader/reference/kernel-c" description="全部函数、类型与枚举的逐项说明。" />
+  <Card title="Kernel.hpp" href="/docs/loader/reference/kernel-cpp" description="RAII 句柄与模板化 Hook" />
+  <Card title="Nt.h" href="/docs/loader/reference/nt" description="SSO 网络包的收发与凭据读取。" />
+</Cards>
+
+## 支持的平台
+
+<PlatformMatrix caption="四个平台的预编译库随 CloverLoader-Release 一同分发。" />
+
+## 分发形态
+
+公开的只有 [CloverLoader-Release](https://github.com/CloverNT/CloverLoader-Release)：
+
+<Files>
+  <Folder name="include/CloverNT/Runtime" defaultOpen>
+    <File name="Kernel.h" />
+    <File name="Kernel.hpp" />
+    <File name="Nt.h" />
+  </Folder>
+  <Folder name="lib">
+    <Folder name="windows-x64">
+      <File name="CloverLoader.lib" />
+    </Folder>
+    <Folder name="windows-arm64">
+      <File name="CloverLoader.lib" />
+    </Folder>
+    <Folder name="linux-x64">
+      <File name="libCloverLoader.so" />
+    </Folder>
+    <Folder name="linux-arm64">
+      <File name="libCloverLoader.so" />
+    </Folder>
+  </Folder>
+  <File name="CMakeLists.txt" />
+</Files>
+
+Windows 下的 `.lib` 是导入库，Linux 下的 `.so` 是链接桩，两者都不含实现。
+
+根目录的 `CMakeLists.txt` 定义了一个名为 `CloverNT::Runtime` 的导入目标，链接它即可。
+
+## 下一步
+
+<Cards>
+  <Card title="集成到项目" href="/docs/loader/integration" description="用 FetchContent 把 SDK 拉进你的 CMake 工程。" />
+</Cards>

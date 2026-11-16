@@ -1,0 +1,289 @@
+---
+title: 网络包
+description: 监听、修改与收发网络包
+icon: Send
+---
+
+网络包是 CloverCore 最底层的能力，直接接触 QQ 和服务器之间的通信。
+
+
+<Callout type="error">
+  **插件不应该在用户不知情的情况下收发网络包或读取登录凭据。** 
+
+  网络包属于账号通信层，凭据则等同于账号的控制权，任何把它写入远端或外传的行为都应被视为恶意。  
+  请在插件里向用户讲清楚你会用这些能力做什么，并且只在本机使用。
+</Callout>
+
+## 两种网络包
+
+QQNT 和服务器之间有两条相互独立的通道：
+
+<TypeTable
+  type={{
+    SSO: {
+      type: 'Nt::Packet',
+      description: '主要的业务协议通道。好友消息、群操作、状态同步等绝大多数业务请求都走这里。载荷通常是 protobuf',
+    },
+    O3: {
+      type: 'Nt::O3Packet',
+      description: '安全通道，负责环境安全上报，没有 seq / uin / encryption',
+    },
+  }}
+/>
+
+两条通道都有发送事件和接收事件，都继承 `Cancellable`。
+
+虽然凭据事件（`CredentialEvent`）不属于网络包，但也走同一套桥，把它放在后面一起讲。
+
+## 监听
+
+C++ 一侧用事件系统订阅（所有者推荐传 `this` 对应的插件 `weak_ptr`，这里为了简短用了默认所有者）：
+
+```cpp
+bool load() {
+    auto listener = Event::EventBus::getInstance().emplaceListener<Event::PacketRecvEvent>(
+            [this](Event::PacketRecvEvent& event) {
+                const auto& packet = event.packet();
+                if (packet.command == "trpc.msg.olpush.OlPushService.MsgPush") {
+                    logger().info("push: seq={}, body={} bytes", packet.seq, packet.body.size());
+                }
+            });
+    return listener.has_value();
+}
+```
+
+JavaScript 一侧的订阅事件桥：
+
+```ts
+ctx.events.on('packet-recv', (packet) => {
+    if (packet.command === 'trpc.msg.olpush.OlPushService.MsgPush') {
+        ctx.logger.info(`push: seq=${packet.seq}, body=${packet.body.length / 2} bytes`);
+    }
+});
+```
+
+<Callout type="warn">
+  **网络包事件在 QQ 的网络线程上触发，不在主/UI 线程上。**
+  
+  C++ 里回调是同步执行的，别在里面做耗时的事；想做重活，派发到自己的工作线程。  
+  JS 一侧网络包事件是"其他线程发布"的异步事件，监听器会被排到 JS 线程稍后执行，拿到的是一份 JSON 快照。
+</Callout>
+
+**取消事件**和**修改网络包体**只在原生插件上可用。
+
+JS 一侧的内建网络包事件是只读的，具体原因见 [JS 事件 API](/docs/core/js-api/events#内建事件在-js-里是只读的)。
+
+## 修改或取消
+
+C++ 的 `PacketSendEvent` / `PacketRecvEvent` 的 `packet()` 返回的是一个可写引用。
+
+你可以**直接改 `body`**，改完的内容会替代原网络包继续传下去，或者用 `setCancelled(true)` 让这个网络包彻底不生效。
+
+```cpp
+Event::EventBus::getInstance().emplaceListener<Event::PacketSendEvent>(
+        [this](Event::PacketSendEvent& event) {
+            auto& packet = event.packet();
+            if (packet.command == "SomeService.Call" && shouldRewrite(packet.body)) {
+                packet.body = rewrite(packet.body);   // 替换包体
+            }
+            if (shouldBlock(packet)) {
+                event.setCancelled(true);             // 整个网络包作废
+            }
+        });
+```
+
+<Callout type="warn" title="当心行为不一致">
+  修改之后，**后面的监听器看到的是改过的 `body`**；取消之后**后面的监听器不会再被调用**（这是事件总线的通用行为）。
+  
+  发送方向改动等同于你发了一条自己合成的网络包，接收方向改动等同于你伪造了一条来自服务器的响应。  
+  客户端业务层会按改过的内容继续处理，非常容易造成客户端与服务端的状态不一致。  
+  例如改消息里的用户 id 或聊天 id，服务端并不知情，下一条真实的服务端推送又会把本地状态盖回去。
+
+  确保你知道你在做什么。
+</Callout>
+
+`O3SendEvent` / `O3RecvEvent` 的用法完全一样，`packet()` 返回的是 `Nt::O3Packet&`，没有 `seq`、`uin` 和 `encryption`。
+
+## 主动发送
+
+<Steps>
+<Step>
+
+### 等通道就绪
+
+直接发包的能力依赖 `wrapper.node` 内的会话就绪。
+
+在就绪之前 `ready()` 返回 false，这时候 `send` / `call` 不会报错，只会返回 "没有序列号" 或 "超时无响应"。
+
+最简单的写法是**订阅 `CredentialEvent`**。因为它在凭据捕获之后、业务可用的那一刻触发，收到它意味着通道一定就绪：
+
+```cpp
+Event::EventBus::getInstance().emplaceListener<Event::CredentialEvent>(
+        [this](Event::CredentialEvent&) {
+            if (Nt::ready()) {
+                sendInitialRequests();
+            }
+        });
+```
+
+不想订阅事件、只在真需要发包时判断的话，`Nt::ready()` 就够了。
+
+不要用 "每隔几秒检查一次 ready()" 这种循环。
+
+</Step>
+<Step>
+
+### 发送并拿到序列号
+
+`Nt::send` 是发完就返回，返回 CloverLoader 截到的序列号。
+
+拿到序列号是通常的情况，但不保证一定能拿到。
+
+```cpp
+const Nt::Bytes body = encodeMyRequest();
+const auto seq = Nt::send("SomeService.Call", body);
+if (!seq) {
+    logger().warn("packet sent but sequence not captured");
+}
+```
+
+</Step>
+<Step>
+
+### 等待响应
+
+`Nt::receive` 有两个重载：按**序号**等（例如刚 `send` 过的那一个）或者按**命令名**等（订阅型推送）。
+
+两种写法都会阻塞调用线程直到收到匹配的网络包，或者 `timeout` 到期。
+
+默认超时是 `kDefaultTimeout`（5 秒）。
+
+```cpp
+if (seq) {
+    if (const auto response = Nt::receive(*seq, std::chrono::seconds{3})) {
+        processResponse(response->body);
+    }
+}
+```
+
+按序号等是最稳的方式，前提是上一步真的拿到了序号。
+
+按命令名等适合订阅推送：
+
+```cpp
+if (const auto push = Nt::receive("trpc.msg.olpush.OlPushService.MsgPush", std::chrono::minutes{1})) {
+    // 第一条匹配命令名的推送
+}
+```
+
+</Step>
+</Steps>
+
+### 调用式发送
+
+`Nt::call` 把上面三步合在一起：发送、尽可能按序号等响应、拿不到序号时退回按命令名。
+
+这是最常用，也是最省事的写法。
+
+```cpp
+if (const auto response = Nt::call("SomeService.Call", body)) {
+    processResponse(response->body);
+}
+```
+
+<Callout type="error">
+  `receive` / `call` 是**同步阻塞**的，在**哪个线程调用就会阻塞哪个线程**。
+
+  - **绝不能在 QQ 的主/UI 线程上调用。** JS 插件主进程入口直接调用 `clovernt.packet.call()` 会把整个 Electron 主线程卡住 `timeoutMs` 毫秒。
+  - **绝不能在网络包事件的回调里调用。** 网络包事件跑在网络线程上，你要等的下一条网络包也要走这个线程。
+  - **绝不能在 Hook 的 detour 里调用。** QQ 的调用方会等你返回，和上面同样。
+
+  正确的做法是把等待放到自己开的工作线程，或者在 JS 一侧用 `clovernt.deasync` 把事件循环让出来。
+</Callout>
+
+## 加密
+
+SSO 网络包有一个 `Encryption` 字段，表示 QQNT 用什么密钥加密了网络包体：
+
+<TypeTable
+  type={{
+    'None (0)': {
+      type: '明文',
+      description: '极少见',
+    },
+    'D2Key (1)': {
+      type: '会话密钥',
+      description: '登录完成后的绝大多数业务请求都是这个。d2Key 由登录流程产生，在 Credential 里',
+    },
+    'ZeroKey (2)': {
+      type: '零密钥',
+      description: '登录握手阶段使用，内容本身仍受更外层的 Tea 加密保护',
+    },
+  }}
+/>
+
+事件回调拿到的 `body` 已经是**解密后的明文**，不用自己解。写回去也是写明文。
+
+重加密由下游做。所以在绝大多数时候你不用关心这个字段。
+
+<Callout type="info">
+  手动发包时 `Nt::send` 不需要你指定加密方式，底层路径会按当前通道决定。字段只在读事件时有意义。
+</Callout>
+
+## 凭据
+
+`CredentialEvent` 的载荷 `Nt::Credential` 里是：
+
+<TypeTable
+  type={{
+    uin: { type: 'std::string', description: '数字账号，比如 "10001"' },
+    uid: { type: 'std::string', description: 'NT 账号 id（"u_..."）。' },
+    a2: { type: 'Bytes', description: '长期凭据' },
+    d2: { type: 'Bytes', description: '会话凭据' },
+    d2Key: { type: 'std::array<uint8_t, 16>', description: '会话密钥，固定 16 字节' },
+  }}
+/>
+
+另外 `Nt::credential()` 可以**随时**读取最近一次捕获到的凭据，不触发事件。
+
+<Callout type="error" title="这几项加起来等同于账号在服务器端的完整控制权">
+  把它们写进文件、数据库、日志、发到任何远端（HTTP、WebSocket、telegram bot、GitHub issue 都算），或者让另一个账号的客户端用它们登录，就可视为**账号被盗**。
+
+  你应该做的：把它交给同机的业务逻辑、派生出 QQ 自己也会用到的签名。  
+  不能做的事：持久化到用户看不到的地方、经过网络传输。
+
+  CloverCore 不应，也无法在运行时阻止这些行为。
+</Callout>
+
+## JavaScript 侧接口
+
+JS 的入口在 `ctx.packet` 和 `clovernt.packet`，两者是同一个实例。
+
+**和 C++ 一侧最大的区别是数据形态**：
+
+| | 事件桥（`events.on('packet-recv')`） | 直接 API（`clovernt.packet`） |
+| --- | --- | --- |
+| 包体 | 小写十六进制**字符串**（无 `0x` 前缀） | `Uint8Array` |
+| 凭据字节 | 小写十六进制字符串 | `Uint8Array` |
+| 能不能拦截 | 不能，只读 | 自己主动请求 |
+| 用途 | 被动监听 | 主动调用式发送 |
+
+类型是可以互相转换的：
+
+```ts
+const fromHex = (hex: string) =>
+    new Uint8Array(hex.match(/.{2}/g)?.map((byte) => parseInt(byte, 16)) ?? []);
+const toHex = (bytes: Uint8Array) =>
+    [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+```
+
+详细说明和示例见 [JS 网络包 API](/docs/core/js-api/packet)。
+
+## 参考
+
+<Cards>
+  <Card title="Nt API 参考" href="/docs/core/api/nt" description="C++ 侧 Nt::Packet / 收发接口。" />
+  <Card title="JS 网络包 API" href="/docs/core/js-api/packet" description="clovernt.packet 的全部方法。" />
+  <Card title="事件系统" href="/docs/core/guides/events" description="监听、取消与跨语言事件的通用说明。" />
+  <Card title="CloverLoader Nt.h" href="/docs/loader/reference/nt" description="底层 C ABI。" />
+</Cards>
